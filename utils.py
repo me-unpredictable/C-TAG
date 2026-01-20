@@ -1,25 +1,59 @@
+"""
+utils.py
+
+Description: 
+    Utilities for trajectory dataset loading, preprocessing, and batching.
+    Implements a "Lazy Loading" strategy to handle large datasets (like SDD) 
+    that exceed RAM capacity by processing video-by-video and sharding the output.
+
+Author: me__unpredictable (vishal patel) https://vishalresearch.com
+"""
+
 import os
 import math
 import sys
 import pickle
-
 import torch
 import torch.nn as nn
 import numpy as np
 import networkx as nx
 from torch.utils.data import Dataset
 from tqdm import tqdm
+import glob
 
-def anorm(p1,p2): 
-    NORM = math.sqrt((p1[0]-p2[0])**2+ (p1[1]-p2[1])**2)
-    if NORM ==0:
+# -----------------------------------------------------------------------------
+# HELPER FUNCTIONS
+# -----------------------------------------------------------------------------
+
+def anorm(p1, p2): 
+    """
+    Calculates the inverse Euclidean distance between two points.
+    Used for graph edge weights (closer nodes = higher weight).
+    
+    Args:
+        p1, p2: (x,y) coordinates
+    """
+    NORM = math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
+    if NORM == 0:
         return 0
-    return 1/(NORM)
+    return 1 / (NORM)
                 
 def seq_to_graph(seq_, seq_rel, norm_lap_matr=True):
-    '''
-    Vectorized version of graph construction.
-    '''
+    """
+    Converts a sequence of spatial coordinates into a sequence of Graph Adjacency Matrices.
+    
+    Why: The GCN model needs to know the spatial relationships (edges) between agents.
+    How: Computes pairwise inverse Euclidean distances for every frame.
+    
+    Args:
+        seq_: Absolute coordinates [N, 2, Seq_Len]
+        seq_rel: Relative coordinates [N, 2, Seq_Len]
+    Returns:
+        V: Node features (Velocity/Relative displacements)
+        A: Adjacency matrices (Spatial relationships)
+    
+    Author: me__unpredictable (vishal patel) https://vishalresearch.com
+    """
     # Ensure inputs are on CPU and numpy for vectorization
     if torch.is_tensor(seq_):
         seq_np = seq_.detach().cpu().numpy()
@@ -28,7 +62,6 @@ def seq_to_graph(seq_, seq_rel, norm_lap_matr=True):
         seq_np = seq_
         seq_rel_np = seq_rel
 
-    # Handle shape consistency
     if seq_np.ndim == 2:
         seq_np = seq_np[np.newaxis, :, :]
         seq_rel_np = seq_rel_np[np.newaxis, :, :]
@@ -43,6 +76,7 @@ def seq_to_graph(seq_, seq_rel, norm_lap_matr=True):
         V[s, :, :] = seq_rel_np[:, :, s]
         pos_s = seq_np[:, :, s]
         
+        # Broadcasting to compute pairwise differences (N x N) matrix
         diff = pos_s[:, np.newaxis, :] - pos_s[np.newaxis, :, :]
         dists = np.linalg.norm(diff, axis=2)
 
@@ -51,7 +85,7 @@ def seq_to_graph(seq_, seq_rel, norm_lap_matr=True):
             mask = dists != 0
             adj_mat[mask] = 1.0 / dists[mask]
         
-        np.fill_diagonal(adj_mat, 1)
+        np.fill_diagonal(adj_mat, 1) # Self-loops
 
         if norm_lap_matr:
             G = nx.from_numpy_array(adj_mat)
@@ -63,6 +97,10 @@ def seq_to_graph(seq_, seq_rel, norm_lap_matr=True):
     return torch.from_numpy(V).type(torch.float), torch.from_numpy(A).type(torch.float)
 
 def poly_fit(traj, traj_len, threshold):
+    """
+    Determines if a trajectory is non-linear using polynomial regression.
+    Used to calculate the 'non_linear_ped' metric for evaluation.
+    """
     t = np.linspace(0, traj_len - 1, traj_len)
     res_x = np.polyfit(t, traj[0, -traj_len:], 2, full=True)[1] 
     res_y = np.polyfit(t, traj[1, -traj_len:], 2, full=True)[1] 
@@ -72,6 +110,10 @@ def poly_fit(traj, traj_len, threshold):
         return 0.0
 
 def read_file(_path, delim='\t'):
+    """
+    Reads a text-based trajectory file and returns a numpy array.
+    Handles delimiters and SDD specific class mappings.
+    """
     data = []
     if delim == 'space':
         delim = ' ' 
@@ -110,6 +152,7 @@ def read_file(_path, delim='\t'):
         if len(data) > 0 and len(data[0]) < 2:
             raise ValueError("Likely wrong delimiter")    
     except:
+        # Fallback logic for delimiter mismatch
         data = []
         if delim == '\t': delim = ' '
         else: delim = '\t'
@@ -118,9 +161,77 @@ def read_file(_path, delim='\t'):
             
     return np.asarray(data)
 
+def seq_collate(data):
+    """
+    Custom Collate Function for DataLoader.
+    
+    Why: Our data contains sequences with a VARIABLE number of pedestrians.
+    Standard PyTorch default_collate cannot stack tensors of different sizes (e.g. [10, 2, 8] and [5, 2, 8]).
+    
+    How: We concatenate everything along the 0-th dimension (flattening the batch)
+    and use `seq_start_end` to track where one batch sample ends and the next begins.
+    
+    Author: me__unpredictable (vishal patel) https://vishalresearch.com
+    """
+    (obs_seq_list, pred_seq_list, obs_seq_rel_list, pred_seq_rel_list,
+     non_linear_ped_list, loss_mask_list, v_obs_list, A_obs_list,
+     v_pred_list, A_pred_list, seq_meta_list) = zip(*data)
+
+    _len = [len(seq) for seq in obs_seq_list]
+    cum_start_idx = [0] + np.cumsum(_len).tolist()
+    seq_start_end = [[start, end] for start, end in zip(cum_start_idx, cum_start_idx[1:])]
+
+    # Concatenate all trajectories into one long tensor
+    obs_traj = torch.cat(obs_seq_list, dim=0)
+    pred_traj = torch.cat(pred_seq_list, dim=0)
+    obs_traj_rel = torch.cat(obs_seq_rel_list, dim=0)
+    pred_traj_rel = torch.cat(pred_seq_rel_list, dim=0)
+    non_linear_ped = torch.cat(non_linear_ped_list, dim=0)
+    loss_mask = torch.cat(loss_mask_list, dim=0)
+    
+    # Graphs: Concatenate Nodes along dim 1
+    v_obs = torch.cat(v_obs_list, dim=1) 
+    v_pred = torch.cat(v_pred_list, dim=1)
+    
+    # Adjacency: Construct Block Diagonal Matrix
+    total_nodes = sum(_len)
+    T_obs = A_obs_list[0].shape[0]
+    T_pred = A_pred_list[0].shape[0]
+    
+    A_obs = torch.zeros(T_obs, total_nodes, total_nodes)
+    A_pred = torch.zeros(T_pred, total_nodes, total_nodes)
+    
+    curr_idx = 0
+    for i, n_nodes in enumerate(_len):
+        A_obs[:, curr_idx:curr_idx+n_nodes, curr_idx:curr_idx+n_nodes] = A_obs_list[i]
+        A_pred[:, curr_idx:curr_idx+n_nodes, curr_idx:curr_idx+n_nodes] = A_pred_list[i]
+        curr_idx += n_nodes
+
+    out = [
+        obs_traj, pred_traj, obs_traj_rel, pred_traj_rel, non_linear_ped,
+        loss_mask, v_obs, A_obs, v_pred, A_pred, seq_meta_list, seq_start_end
+    ]
+    return tuple(out)
+
+
+# -----------------------------------------------------------------------------
+# DATASET CLASS
+# -----------------------------------------------------------------------------
 
 class TrajectoryDataset(Dataset):
-    """Dataloder for the Trajectory datasets"""
+    """
+    DataLoader for Trajectory Datasets (SDD, ETH/UCY).
+    
+    Feature: Lazy Loading / Sharding.
+    Instead of loading the entire dataset into RAM (which crashes on SDD),
+    this class reads pre-processed 'shard' files (.pkl) on demand.
+    
+    Structure:
+    - Preprocessing (mk_splits=True): Reads raw text files, generates graphs, saves 1 PKL per video.
+    - Training (mk_splits=False): Scans all PKL files, builds an index map, loads only required files during __getitem__.
+    
+    Author: me__unpredictable (vishal patel) https://vishalresearch.com
+    """
     def __init__(
         self, data_dir, obs_len=8, pred_len=8, skip=1, threshold=0.2,
         min_ped=1, delim='\t', norm_lap_matr=True, fill_missing=False, 
@@ -141,52 +252,19 @@ class TrajectoryDataset(Dataset):
         self.n_splits = n_splits
         self.dataset_name = dataset_name
         self.processed_dir = processed_dir
+        self.min_ped = min_ped
+        self.threshold = threshold
 
-        # -------------------------------------------------------------------------
-        # 1. Loading Path: Try loading PKL from processed_dir
-        # -------------------------------------------------------------------------
-        # We try to load the specific split provided by 'dataset_name' logic or just generic load
-        # Since the class is initialized usually with a specific intent, we can check 
-        # if we are in training mode (not mk_splits) and if pkl exists.
-        
-        # However, typically this class is called with mk_splits=True once to generate data,
-        # and then called with mk_splits=False to load it. 
-        # When loading, we might need to know WHICH split to load, but usually the dataloader 
-        # points to the specific split folder (e.g. data_dir/train).
-        
-        # Checking if data_dir contains a .pkl file directly (Standard C-TAG behavior)
-        pkl_files = [f for f in os.listdir(self.data_dir) if f.endswith('.pkl')]
-        if not mk_splits and len(pkl_files) > 0:
-            pkl_path = os.path.join(self.data_dir, pkl_files[0])
-            print(f"Loading data from Pickle file: {pkl_path}")
-            with open(pkl_path, 'rb') as f:
-                saved_data = pickle.load(f)
-            
-            self.obs_traj = saved_data['obs_traj'].type(torch.float)
-            self.pred_traj = saved_data['pred_traj'].type(torch.float)
-            self.obs_traj_rel = saved_data['obs_traj_rel'].type(torch.float)
-            self.pred_traj_rel = saved_data['pred_traj_rel'].type(torch.float)
-            self.loss_mask = saved_data['loss_mask'].type(torch.float)
-            self.non_linear_ped = saved_data['non_linear_ped'].type(torch.float)
-            self.num_peds_in_seq = saved_data['num_peds_in_seq']
-            self.seq_meta = saved_data['seq_meta'] # Load Metadata
-            
-            self.v_obs = saved_data['v_obs']
-            self.A_obs = saved_data['A_obs']
-            self.v_pred = saved_data['v_pred']
-            self.A_pred = saved_data['A_pred']
-            
-            cum_start_idx = [0] + np.cumsum(self.num_peds_in_seq).tolist()
-            self.seq_start_end = [
-                (start, end)
-                for start, end in zip(cum_start_idx, cum_start_idx[1:])
-            ]
-            self.num_seq = len(self.seq_start_end)
-            return # Exit init after loading
+        # If not making splits, we assume data is already processed.
+        # We perform Lazy Loading initialization.
+        if not mk_splits:
+            self._init_lazy_loading()
+            return
 
-        # -------------------------------------------------------------------------
-        # 2. Processing Path: Read Raw Files -> Split -> Save
-        # -------------------------------------------------------------------------
+        # -----------------------------------------------------------
+        # PROCESSING PIPELINE (mk_splits=True)
+        # -----------------------------------------------------------
+        # This section runs once to convert raw text -> sharded PKL files
         
         if dataset_name.lower() in ['eth','hotel','univ','zara1','zara2']:
             self.delim = '\t'
@@ -203,12 +281,11 @@ class TrajectoryDataset(Dataset):
             scenes = [s for s in scenes if os.path.isdir(os.path.join(data_dir, 'annotations', s))]
             scenes.sort() 
 
-            # Divide scenes
+            # Scene Split Logic
             val_scene = [scenes[-1]]
             scenes = scenes[:-1]
-            
             if len(scenes) > 4:
-                test_scene = scenes[-2:] # Returns list, no brackets needed
+                test_scene = scenes[-2:] 
                 train_scene = scenes[:-2]
             else:
                 test_scene = [scenes[-1]] 
@@ -221,175 +298,270 @@ class TrajectoryDataset(Dataset):
             }
 
             for s in splits:
-                # Containers for current split
-                seq_list = []
-                seq_list_rel = []
-                loss_mask_list = []
-                non_linear_ped_list = []
-                num_peds_in_seq = []
-                seq_meta_list = [] # Metadata container
-                
-                graph_v_obs = []
-                graph_a_obs = []
-                graph_v_pred = []
-                graph_a_pred = []
-
                 scenes_in_split = splits[s]
-                print(f"Processing {s} split with {len(scenes_in_split)} scenes: {scenes_in_split}")
+                print(f"Processing {s} split with {len(scenes_in_split)} scenes.")
 
-                # Loop over ALL scenes in the split
+                # Create output directory for this split
+                split_out_dir = os.path.join(self.processed_dir, s)
+                os.makedirs(split_out_dir, exist_ok=True)
+
                 for scene_name in scenes_in_split:
                     current_scene_path = os.path.join(data_dir, 'annotations', scene_name)
                     if not os.path.isdir(current_scene_path): continue
                     
                     videos = os.listdir(current_scene_path)
                     
+                    # Process EVERY video individually to save RAM
                     for v in videos:
                         path = os.path.join(current_scene_path, v, 'annotations.txt')
                         if not os.path.exists(path): continue
                         
-                        # Metadata string for this video
-                        meta_id = f"{scene_name}_{v}.pt"
-
+                        meta_id = f"{scene_name}_{v}.pt" # Metadata string
+                        save_name = f"{scene_name}_{v}.pkl"
+                        save_path = os.path.join(split_out_dir, save_name)
+                        
                         print(f"Processing Split: {s} | Scene: {scene_name} | Video: {v}")
+                        self._process_single_video(path, meta_id, save_path)
 
-                        # Read File
-                        if 'sdd' in self.dataset_name.lower():
-                            raw_data = read_file(path, delim)
-                            if raw_data.shape[1] >= 6: 
-                                center_x = (raw_data[:, 1] + raw_data[:, 3]) / 2.0
-                                center_y = (raw_data[:, 2] + raw_data[:, 4]) / 2.0
-                                track_id = raw_data[:, 0]
-                                frame_id = raw_data[:, 5]
-                                data = np.stack((frame_id, track_id, center_x, center_y), axis=1)
-                            else:
-                                data = raw_data[:, :4]
-                        else:
-                            data = read_file(path, delim)
-                        
-                        data = data[data[:, 0].argsort()]
-                        frames = np.unique(data[:, 0]).tolist()
-                        frame_data = []
-                        num_sequences = int(math.ceil((len(frames) - self.seq_len + 1) / skip))
-                        
-                        for frame in frames:
-                            frame_data.append(data[frame == data[:, 0], :])
+    def _process_single_video(self, file_path, meta_id, save_path):
+        """
+        Helper function to process one video file and save it immediately.
+        This prevents RAM accumulation.
+        """
+        # 1. Read Data
+        if 'sdd' in self.dataset_name.lower():
+            raw_data = read_file(file_path, self.delim)
+            if raw_data.shape[1] >= 6: 
+                # SDD: [TrackID, xmin, ymin, xmax, ymax, Frame, ..., Label]
+                center_x = (raw_data[:, 1] + raw_data[:, 3]) / 2.0
+                center_y = (raw_data[:, 2] + raw_data[:, 4]) / 2.0
+                track_id = raw_data[:, 0]
+                frame_id = raw_data[:, 5]
+                data = np.stack((frame_id, track_id, center_x, center_y), axis=1)
+            else:
+                data = raw_data[:, :4]
+        else:
+            data = read_file(file_path, self.delim)
+        
+        data = data[data[:, 0].argsort()] # Sort by Frame
+        frames = np.unique(data[:, 0]).tolist()
+        frame_data = []
+        for frame in frames:
+            frame_data.append(data[frame == data[:, 0], :])
 
-                        seq_iterator = tqdm(range(0, num_sequences * self.skip + 1, skip), total=num_sequences)
+        # 2. Containers for this video ONLY
+        seq_list = []
+        seq_list_rel = []
+        loss_mask_list = []
+        non_linear_ped_list = []
+        num_peds_in_seq = []
+        seq_meta_list = []
+        
+        graph_v_obs = []
+        graph_a_obs = []
+        graph_v_pred = []
+        graph_a_pred = []
 
-                        for idx in seq_iterator:
-                            curr_seq_data = np.concatenate(frame_data[idx:idx + self.seq_len], axis=0)
-                            peds_in_curr_seq = np.unique(curr_seq_data[:, 1])
-                            
-                            curr_seq_rel = np.zeros((len(peds_in_curr_seq), 2, self.seq_len))
-                            curr_seq = np.zeros((len(peds_in_curr_seq), 2, self.seq_len))
-                            curr_loss_mask = np.zeros((len(peds_in_curr_seq), self.seq_len))
-                            
-                            num_peds_considered = 0
-                            _non_linear_ped = []
-                            
-                            for _, obj_id in enumerate(peds_in_curr_seq):
-                                curr_obj_seq = curr_seq_data[curr_seq_data[:, 1] == obj_id, :]
-                                curr_obj_seq = np.around(curr_obj_seq, decimals=4)
-                                
-                                obj_front = frames.index(curr_obj_seq[0, 0]) - idx
-                                obj_end = frames.index(curr_obj_seq[-1, 0]) - idx + 1
-                                
-                                if obj_end - obj_front != self.seq_len: continue 
-                                if len(curr_obj_seq) != self.seq_len: continue
+        # 3. Sliding Window
+        num_sequences = int(math.ceil((len(frames) - self.seq_len + 1) / self.skip))
+        
+        # RESTORED TQDM HERE
+        iterator = tqdm(range(0, num_sequences * self.skip + 1, self.skip), 
+                       total=num_sequences, 
+                       desc=f"Sequences ({meta_id})",
+                       leave=False)
 
-                                curr_obj_seq = np.transpose(curr_obj_seq[:, 2:4]) 
-                                
-                                rel_curr_obj_seq = np.zeros(curr_obj_seq.shape)
-                                rel_curr_obj_seq[:, 1:] = curr_obj_seq[:, 1:] - curr_obj_seq[:, :-1]
-                                
-                                _idx = num_peds_considered
-                                curr_seq[_idx, :, obj_front:obj_end] = curr_obj_seq
-                                curr_seq_rel[_idx, :, obj_front:obj_end] = rel_curr_obj_seq
-                                
-                                _non_linear_ped.append(poly_fit(curr_obj_seq, pred_len, threshold))
-                                curr_loss_mask[_idx, obj_front:obj_end] = 1
-                                num_peds_considered += 1
+        for idx in iterator:
+            # Check bounds
+            if idx + self.seq_len > len(frame_data): break
 
-                            if num_peds_considered > min_ped:
-                                non_linear_ped_list.append(np.array(_non_linear_ped))
-                                num_peds_in_seq.append(num_peds_considered)
-                                loss_mask_list.append(curr_loss_mask[:num_peds_considered])
-                                
-                                # Store Metadata (1 per sequence)
-                                seq_meta_list.append(meta_id)
-                                
-                                s_ = curr_seq[:num_peds_considered]
-                                s_rel_ = curr_seq_rel[:num_peds_considered]
-                                
-                                seq_list.append(s_)
-                                seq_list_rel.append(s_rel_)
+            curr_seq_data = np.concatenate(frame_data[idx:idx + self.seq_len], axis=0)
+            peds_in_curr_seq = np.unique(curr_seq_data[:, 1])
+            
+            curr_seq_rel = np.zeros((len(peds_in_curr_seq), 2, self.seq_len))
+            curr_seq = np.zeros((len(peds_in_curr_seq), 2, self.seq_len))
+            curr_loss_mask = np.zeros((len(peds_in_curr_seq), self.seq_len))
+            
+            num_peds_considered = 0
+            _non_linear_ped = []
+            
+            for _, obj_id in enumerate(peds_in_curr_seq):
+                curr_obj_seq = curr_seq_data[curr_seq_data[:, 1] == obj_id, :]
+                curr_obj_seq = np.around(curr_obj_seq, decimals=4)
+                
+                obj_front = frames.index(curr_obj_seq[0, 0]) - idx
+                obj_end = frames.index(curr_obj_seq[-1, 0]) - idx + 1
+                
+                if obj_end - obj_front != self.seq_len: continue 
+                if len(curr_obj_seq) != self.seq_len: continue
 
-                                v_o, a_o = seq_to_graph(s_[:, :, :self.obs_len], s_rel_[:, :, :self.obs_len], self.norm_lap_matr)
-                                graph_v_obs.append(v_o.clone())
-                                graph_a_obs.append(a_o.clone())
-                                
-                                v_p, a_p = seq_to_graph(s_[:, :, self.obs_len:], s_rel_[:, :, self.obs_len:], self.norm_lap_matr)
-                                graph_v_pred.append(v_p.clone())
-                                graph_a_pred.append(a_p.clone())
+                # Transpose and extract X,Y
+                curr_obj_seq = np.transpose(curr_obj_seq[:, 2:4]) 
+                rel_curr_obj_seq = np.zeros(curr_obj_seq.shape)
+                rel_curr_obj_seq[:, 1:] = curr_obj_seq[:, 1:] - curr_obj_seq[:, :-1]
+                
+                _idx = num_peds_considered
+                curr_seq[_idx, :, obj_front:obj_end] = curr_obj_seq
+                curr_seq_rel[_idx, :, obj_front:obj_end] = rel_curr_obj_seq
+                
+                _non_linear_ped.append(poly_fit(curr_obj_seq, self.pred_len, self.threshold))
+                curr_loss_mask[_idx, obj_front:obj_end] = 1
+                num_peds_considered += 1
 
-                # Concatenate and Save
-                if len(seq_list) > 0:
-                    seq_list = np.concatenate(seq_list, axis=0)
-                    seq_list_rel = np.concatenate(seq_list_rel, axis=0)
-                    loss_mask_list = np.concatenate(loss_mask_list, axis=0)
-                    non_linear_ped = np.concatenate(non_linear_ped_list, axis=0)
-                    
-                    self.obs_traj = torch.from_numpy(seq_list[:, :, :self.obs_len]).type(torch.float)
-                    self.pred_traj = torch.from_numpy(seq_list[:, :, self.obs_len:]).type(torch.float)
-                    self.obs_traj_rel = torch.from_numpy(seq_list_rel[:, :, :self.obs_len]).type(torch.float)
-                    self.pred_traj_rel = torch.from_numpy(seq_list_rel[:, :, self.obs_len:]).type(torch.float)
-                    self.loss_mask = torch.from_numpy(loss_mask_list).type(torch.float)
-                    self.non_linear_ped = torch.from_numpy(non_linear_ped).type(torch.float)
-                    self.num_peds_in_seq = num_peds_in_seq
-                    self.seq_meta = seq_meta_list # Store list of strings
-                    
-                    self.v_obs = graph_v_obs
-                    self.A_obs = graph_a_obs
-                    self.v_pred = graph_v_pred
-                    self.A_pred = graph_a_pred
-                    
-                    cum_start_idx = [0] + np.cumsum(self.num_peds_in_seq).tolist()
-                    self.seq_start_end = [
-                        (start, end)
-                        for start, end in zip(cum_start_idx, cum_start_idx[1:])
-                    ]
-                    self.num_seq = len(self.seq_start_end)
+            if num_peds_considered >= self.min_ped:
+                non_linear_ped_list.append(np.array(_non_linear_ped))
+                num_peds_in_seq.append(num_peds_considered)
+                loss_mask_list.append(curr_loss_mask[:num_peds_considered])
+                seq_meta_list.append(meta_id)
+                
+                s_ = curr_seq[:num_peds_considered]
+                s_rel_ = curr_seq_rel[:num_peds_considered]
+                seq_list.append(s_)
+                seq_list_rel.append(s_rel_)
 
-                    # Save PKL
-                    split_path = os.path.join(self.processed_dir, s)
-                    if not os.path.exists(split_path):
-                        os.makedirs(split_path)
-                    pkl_path = os.path.join(split_path, f"{s}.pkl")
-                    
-                    print(f"Saving processed data for {s} split to {pkl_path}...")
-                    with open(pkl_path, 'wb') as f:
-                        pickle.dump(self.__dict__, f)
-                else:
-                    print(f"Warning: No sequences found for split {s}")
+                # Graph Generation
+                v_o, a_o = seq_to_graph(s_[:, :, :self.obs_len], s_rel_[:, :, :self.obs_len], self.norm_lap_matr)
+                graph_v_obs.append(v_o.clone())
+                graph_a_obs.append(a_o.clone())
+                
+                v_p, a_p = seq_to_graph(s_[:, :, self.obs_len:], s_rel_[:, :, self.obs_len:], self.norm_lap_matr)
+                graph_v_pred.append(v_p.clone())
+                graph_a_pred.append(a_p.clone())
+
+        # 4. Save to Disk
+        if len(seq_list) > 0:
+            data_dict = {
+                'obs_traj': torch.from_numpy(np.concatenate(seq_list, axis=0)[:, :, :self.obs_len]).type(torch.float),
+                'pred_traj': torch.from_numpy(np.concatenate(seq_list, axis=0)[:, :, self.obs_len:]).type(torch.float),
+                'obs_traj_rel': torch.from_numpy(np.concatenate(seq_list_rel, axis=0)[:, :, :self.obs_len]).type(torch.float),
+                'pred_traj_rel': torch.from_numpy(np.concatenate(seq_list_rel, axis=0)[:, :, self.obs_len:]).type(torch.float),
+                'loss_mask': torch.from_numpy(np.concatenate(loss_mask_list, axis=0)).type(torch.float),
+                'non_linear_ped': torch.from_numpy(np.concatenate(non_linear_ped_list, axis=0)).type(torch.float),
+                'num_peds_in_seq': num_peds_in_seq,
+                'seq_meta': seq_meta_list,
+                'v_obs': graph_v_obs,
+                'A_obs': graph_a_obs,
+                'v_pred': graph_v_pred,
+                'A_pred': graph_a_pred
+            }
+            with open(save_path, 'wb') as f:
+                pickle.dump(data_dict, f)
+            print(f"Saved {save_path} with {len(seq_list)} sequences.")
+        else:
+            print(f"No valid sequences in {meta_id}")
+
+    # -----------------------------------------------------------
+    # LAZY LOADING PIPELINE (mk_splits=False)
+    # -----------------------------------------------------------
+    def _init_lazy_loading(self):
+        """
+        Scans the processed directory for PKL files and builds an index map.
+        This allows us to access the dataset as if it were contiguous, while
+        reading from disk on demand.
+        """
+        # Find all .pkl files in the data_dir (e.g. processed/train/*.pkl)
+        search_path = os.path.join(self.data_dir, "*.pkl")
+        self.shard_paths = sorted(glob.glob(search_path))
+        
+        if len(self.shard_paths) == 0:
+            raise ValueError(f"No .pkl files found in {self.data_dir}. Did you run with mk_splits=True?")
+
+        print(f"Found {len(self.shard_paths)} shards. Building index...")
+        
+        self.index_map = [] # [(file_idx, local_idx), ...]
+        self.num_seq = 0
+        
+        # We need to know how many sequences are in each file to build the map.
+        for file_idx, p_path in enumerate(tqdm(self.shard_paths, desc="Indexing")):
+            with open(p_path, 'rb') as f:
+                d = pickle.load(f)
+                count = len(d['num_peds_in_seq'])
+                
+                for i in range(count):
+                    self.index_map.append((file_idx, i))
+                
+                self.num_seq += count
+        
+        print(f"Total sequences indexed: {self.num_seq}")
+        
+        # Cache for the currently loaded file
+        self.current_file_idx = -1
+        self.current_data = None
 
     def __len__(self):
         return self.num_seq
 
     def __getitem__(self, index):
-        start, end = self.seq_start_end[index]
+        """
+        Lazy Load Item.
+        1. Look up which file contains 'index'.
+        2. Load that file (if not already loaded).
+        3. Extract the item.
+        """
+        file_idx, local_idx = self.index_map[index]
+        
+        # Cache Mechanism: Load file only if it's different from the one in memory
+        if self.current_file_idx != file_idx:
+            with open(self.shard_paths[file_idx], 'rb') as f:
+                self.current_data = pickle.load(f)
+            self.current_file_idx = file_idx
+            
+            # Pre-calculate start indices for this file (for slicing flat tensors)
+            self.cum_start_idx = [0] + np.cumsum(self.current_data['num_peds_in_seq']).tolist()
+
+        # Retrieve data from loaded shard
+        d = self.current_data
+        start = self.cum_start_idx[local_idx]
+        end = self.cum_start_idx[local_idx+1]
+        
         out = [
-            self.obs_traj[start:end, :], self.pred_traj[start:end, :],
-            self.obs_traj_rel[start:end, :], self.pred_traj_rel[start:end, :],
-            self.non_linear_ped[start:end], self.loss_mask[start:end, :],
-            self.v_obs[index], self.A_obs[index],
-            self.v_pred[index], self.A_pred[index],
-            self.seq_meta[index] # Return metadata
+            d['obs_traj'][start:end, :].clone(),
+            d['pred_traj'][start:end, :].clone(),
+            d['obs_traj_rel'][start:end, :].clone(),
+            d['pred_traj_rel'][start:end, :].clone(),
+            d['non_linear_ped'][start:end].clone(),
+            d['loss_mask'][start:end, :].clone(),
+            d['v_obs'][local_idx].clone(),
+            d['A_obs'][local_idx].clone(),
+            d['v_pred'][local_idx].clone(),
+            d['A_pred'][local_idx].clone(),
+            d['seq_meta'][local_idx]
         ]
         return out
 
-    def get_fold(self, fold_index):
-        train_idx, val_idx = self.kfolds[fold_index]
-        train_data = [self.__getitem__(i) for i in train_idx]
-        val_data = [self.__getitem__(i) for i in val_idx]
-        return train_data, val_data
+    @staticmethod
+    def collate_fn(batch):
+        return seq_collate(batch)
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data_dir', type=str, required=True, help='Path to raw data directory')
+    parser.add_argument('--obs_len', type=int, default=8, help='Observation length')
+    parser.add_argument('--pred_len', type=int, default=12, help='Prediction length')
+    parser.add_argument('--skip', type=int, default=1, help='Frame skip rate')
+    parser.add_argument('--threshold', type=float, default=0.2, help='Non-linearity threshold')
+    parser.add_argument('--min_ped', type=int, default=1, help='Minimum pedestrians per sequence')
+    parser.add_argument('--delim', type=str, default='\t', help='Data delimiter')
+    parser.add_argument('--norm_lap_matr', action='store_true', help='Use normalized Laplacian matrix')
+    parser.add_argument('--fill_missing', action='store_true', help='Fill missing data')
+    parser.add_argument('--dataset_name', type=str, default='', help='Name of the dataset (e.g., sdd, eth)')
+    parser.add_argument('--processed_dir', type=str, default='./processed', help='Directory to save processed data')
+    args = parser.parse_args()
+
+    print("Starting data processing...")
+    dataset = TrajectoryDataset(
+        data_dir=args.data_dir,
+        obs_len=args.obs_len,
+        pred_len=args.pred_len,
+        skip=args.skip,
+        threshold=args.threshold,
+        min_ped=args.min_ped,
+        delim=args.delim,
+        norm_lap_matr=args.norm_lap_matr,
+        fill_missing=args.fill_missing,
+        mk_splits=True,
+        dataset_name=args.dataset_name,
+        processed_dir=args.processed_dir
+    )
+    print("Data processing completed.")

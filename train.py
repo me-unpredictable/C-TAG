@@ -87,9 +87,9 @@ def graph_loss(V_pred,V_target):
 obs_seq_len = args.obs_seq_len
 pred_seq_len = args.pred_seq_len
 data_set = args.dataset_path 
-# check if the train dataset is already saved
-if os.path.exists(data_set+'train/dataset.pkl'):
-    with open(data_set+'train/dataset.pkl', 'rb') as f:
+# check if the train dataset is already saved (in .processed)
+if os.path.exists('./processed/train/train.pkl'):
+    with open('./processed/train/train.pkl', 'rb') as f:
         dset_train = pickle.load(f)
 else:
     dset_train = TrajectoryDataset(
@@ -112,8 +112,8 @@ loader_train = DataLoader(
 
 if not args.skip_val:
     # check if the val dataset is already saved
-    if os.path.exists(data_set+'val/dataset.pkl'):
-        with open(data_set+'val/dataset.pkl', 'rb') as f:
+    if os.path.exists('./processed/val/val.pkl'):
+        with open('./processed/val/val.pkl', 'rb') as f:
             dset_val = pickle.load(f)
     # else:
     #     dset_val =TrajectoryDataset(
@@ -205,8 +205,18 @@ def train(epoch, model, optimizer, loader_train, metrics):
 
     for cnt, batch in enumerate(loader_train): 
         batch_count += 1
-        batch = [tensor.cuda() for tensor in batch]
-        obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr = batch
+
+        # 1. Slice off the metadata (last 2 items: metadata tuple and sequence start_end list)
+        # The first 10 items are the tensors we need for the model
+        batch_tensors = batch[:-1]
+    
+        # Optional: Capture metadata if you want to use it for logging/debugging
+        batch_meta = batch[-1]      # The tuple of 'scene_video.pt' strings
+        # print('Batch meta:', batch_meta)
+        # batch_start_end = batch[-1] # The sequence start/end indices
+
+        batch = [tensor.cuda() for tensor in batch_tensors]
+        obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr = batch [:10]
 
         optimizer.zero_grad()
         V_obs_tmp = V_obs.permute(0, 3, 1, 2)
@@ -238,6 +248,7 @@ def train(epoch, model, optimizer, loader_train, metrics):
 
 def vald(epoch, model, loader_val, metrics, constant_metrics):
     model.eval()
+    loss=torch.ones(1).cuda()
     loss_batch = 0 
     batch_count = 0
     is_fst_loss = True
@@ -245,15 +256,24 @@ def vald(epoch, model, loader_val, metrics, constant_metrics):
     turn_point = int(loader_len / args.batch_size) * args.batch_size + loader_len % args.batch_size - 1
     
     for cnt, batch in enumerate(loader_val): 
-        batch_count += 1
-        batch = [tensor.cuda() for tensor in batch]
+        # 1. Slice off the metadata (last 2 items: metadata tuple and sequence start_end list)
+        # The first 10 items are the tensors we need for the model
+        batch_tensors = batch[:-1]
+    
+        # Optional: Capture metadata if you want to use it for logging/debugging
+        batch_meta = batch[-1]      # The tuple of 'scene_video.pt' strings
+        # print('Batch meta:', batch_meta)
+        # batch_start_end = batch[-1] # The sequence start/end indices
+
+        batch = [tensor.cuda() for tensor in batch_tensors]
         obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr = batch
         V_obs_tmp = V_obs.permute(0, 3, 1, 2)
         V_pred, _ = model(V_obs_tmp, A_obs.squeeze())
         V_pred = V_pred.permute(0, 2, 3, 1)
         V_tr = V_tr.squeeze()
         V_pred = V_pred.squeeze()
-
+        print('Val batch_count:', batch_count)
+        
         if batch_count % args.batch_size != 0 and cnt != turn_point:
             l = graph_loss(V_pred, V_tr)
             if is_fst_loss:
@@ -279,7 +299,18 @@ def calculate_ade_fde(model, loader_val):
 
     with torch.no_grad():
         for batch in loader_val:
-            batch = [tensor.cuda() for tensor in batch]
+            # 1. Slice off the metadata (last 2 items: metadata tuple and sequence start_end list)
+            # The first 10 items are the tensors we need for the model
+            batch_tensors = batch[:-1]
+    
+            # Optional: Capture metadata if you want to use it for logging/debugging
+            batch_meta = batch[-1]      # The tuple of 'scene_video.pt' strings
+            # print('Batch meta:', batch_meta)
+            # batch_start_end = batch[-1] # The sequence start/end indices
+
+            batch = [tensor.cuda() for tensor in batch_tensors]
+        
+            # batch = [tensor.cuda() for tensor in batch]
             obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr = batch
 
             V_obs_tmp = V_obs.permute(0, 3, 1, 2)
@@ -315,9 +346,9 @@ dir_in_dataset=os.listdir(data_set )
 
 
 if args.reload_data:
-    dset_train = TrajectoryDataset(data_set + 'train/', obs_len=args.obs_seq_len, pred_len=args.pred_seq_len, skip=1, norm_lap_matr=True, delim=args.delim, shuffle=args.shuffle, n_splits=args.n_splits)
+    dset_train = TrajectoryDataset('./processed/train/', obs_len=args.obs_seq_len, pred_len=args.pred_seq_len, skip=1, norm_lap_matr=True, delim=args.delim, shuffle=args.shuffle, n_splits=args.n_splits)
     # Save the updated dataset
-    with open(data_set+'train/dataset.pkl', 'wb') as f:
+    with open('./processed/train/train.pkl', 'wb') as f:
         pickle.dump(dset_train, f)
 else:
     # Make sure kfolds is generated for cross-validation
