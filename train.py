@@ -12,7 +12,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm  # [ADDED] For progress bars
 
-from model import TAG
+from model import CTAG
 from utils import TrajectoryDataset
 from metrics import *#ade_loss, fde_loss, bivariate_loss
 
