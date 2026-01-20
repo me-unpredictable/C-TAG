@@ -13,48 +13,22 @@ import os
 import math
 import sys
 import pickle
+import glob
+
 import torch
 import torch.nn as nn
 import numpy as np
 import networkx as nx
 from torch.utils.data import Dataset
 from tqdm import tqdm
-import glob
-
-# -----------------------------------------------------------------------------
-# HELPER FUNCTIONS
-# -----------------------------------------------------------------------------
 
 def anorm(p1, p2): 
-    """
-    Calculates the inverse Euclidean distance between two points.
-    Used for graph edge weights (closer nodes = higher weight).
-    
-    Args:
-        p1, p2: (x,y) coordinates
-    """
     NORM = math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
     if NORM == 0:
         return 0
     return 1 / (NORM)
                 
 def seq_to_graph(seq_, seq_rel, norm_lap_matr=True):
-    """
-    Converts a sequence of spatial coordinates into a sequence of Graph Adjacency Matrices.
-    
-    Why: The GCN model needs to know the spatial relationships (edges) between agents.
-    How: Computes pairwise inverse Euclidean distances for every frame.
-    
-    Args:
-        seq_: Absolute coordinates [N, 2, Seq_Len]
-        seq_rel: Relative coordinates [N, 2, Seq_Len]
-    Returns:
-        V: Node features (Velocity/Relative displacements)
-        A: Adjacency matrices (Spatial relationships)
-    
-    Author: me__unpredictable (vishal patel) https://vishalresearch.com
-    """
-    # Ensure inputs are on CPU and numpy for vectorization
     if torch.is_tensor(seq_):
         seq_np = seq_.detach().cpu().numpy()
         seq_rel_np = seq_rel.detach().cpu().numpy()
@@ -76,7 +50,6 @@ def seq_to_graph(seq_, seq_rel, norm_lap_matr=True):
         V[s, :, :] = seq_rel_np[:, :, s]
         pos_s = seq_np[:, :, s]
         
-        # Broadcasting to compute pairwise differences (N x N) matrix
         diff = pos_s[:, np.newaxis, :] - pos_s[np.newaxis, :, :]
         dists = np.linalg.norm(diff, axis=2)
 
@@ -85,7 +58,7 @@ def seq_to_graph(seq_, seq_rel, norm_lap_matr=True):
             mask = dists != 0
             adj_mat[mask] = 1.0 / dists[mask]
         
-        np.fill_diagonal(adj_mat, 1) # Self-loops
+        np.fill_diagonal(adj_mat, 1)
 
         if norm_lap_matr:
             G = nx.from_numpy_array(adj_mat)
@@ -97,10 +70,6 @@ def seq_to_graph(seq_, seq_rel, norm_lap_matr=True):
     return torch.from_numpy(V).type(torch.float), torch.from_numpy(A).type(torch.float)
 
 def poly_fit(traj, traj_len, threshold):
-    """
-    Determines if a trajectory is non-linear using polynomial regression.
-    Used to calculate the 'non_linear_ped' metric for evaluation.
-    """
     t = np.linspace(0, traj_len - 1, traj_len)
     res_x = np.polyfit(t, traj[0, -traj_len:], 2, full=True)[1] 
     res_y = np.polyfit(t, traj[1, -traj_len:], 2, full=True)[1] 
@@ -110,10 +79,6 @@ def poly_fit(traj, traj_len, threshold):
         return 0.0
 
 def read_file(_path, delim='\t'):
-    """
-    Reads a text-based trajectory file and returns a numpy array.
-    Handles delimiters and SDD specific class mappings.
-    """
     data = []
     if delim == 'space':
         delim = ' ' 
@@ -152,7 +117,6 @@ def read_file(_path, delim='\t'):
         if len(data) > 0 and len(data[0]) < 2:
             raise ValueError("Likely wrong delimiter")    
     except:
-        # Fallback logic for delimiter mismatch
         data = []
         if delim == '\t': delim = ' '
         else: delim = '\t'
@@ -163,15 +127,8 @@ def read_file(_path, delim='\t'):
 
 def seq_collate(data):
     """
-    Custom Collate Function for DataLoader.
-    
-    Why: Our data contains sequences with a VARIABLE number of pedestrians.
-    Standard PyTorch default_collate cannot stack tensors of different sizes (e.g. [10, 2, 8] and [5, 2, 8]).
-    
-    How: We concatenate everything along the 0-th dimension (flattening the batch)
-    and use `seq_start_end` to track where one batch sample ends and the next begins.
-    
-    Author: me__unpredictable (vishal patel) https://vishalresearch.com
+    Custom collate function to handle batches of sequences with 
+    variable numbers of pedestrians.
     """
     (obs_seq_list, pred_seq_list, obs_seq_rel_list, pred_seq_rel_list,
      non_linear_ped_list, loss_mask_list, v_obs_list, A_obs_list,
@@ -181,7 +138,7 @@ def seq_collate(data):
     cum_start_idx = [0] + np.cumsum(_len).tolist()
     seq_start_end = [[start, end] for start, end in zip(cum_start_idx, cum_start_idx[1:])]
 
-    # Concatenate all trajectories into one long tensor
+    # Concatenate all into one big batch tensor
     obs_traj = torch.cat(obs_seq_list, dim=0)
     pred_traj = torch.cat(pred_seq_list, dim=0)
     obs_traj_rel = torch.cat(obs_seq_rel_list, dim=0)
@@ -189,11 +146,10 @@ def seq_collate(data):
     non_linear_ped = torch.cat(non_linear_ped_list, dim=0)
     loss_mask = torch.cat(loss_mask_list, dim=0)
     
-    # Graphs: Concatenate Nodes along dim 1
     v_obs = torch.cat(v_obs_list, dim=1) 
     v_pred = torch.cat(v_pred_list, dim=1)
     
-    # Adjacency: Construct Block Diagonal Matrix
+    # Create Block Diagonal Adjacency Matrix
     total_nodes = sum(_len)
     T_obs = A_obs_list[0].shape[0]
     T_pred = A_pred_list[0].shape[0]
@@ -207,35 +163,23 @@ def seq_collate(data):
         A_pred[:, curr_idx:curr_idx+n_nodes, curr_idx:curr_idx+n_nodes] = A_pred_list[i]
         curr_idx += n_nodes
 
-    out = [
+    return tuple([
         obs_traj, pred_traj, obs_traj_rel, pred_traj_rel, non_linear_ped,
         loss_mask, v_obs, A_obs, v_pred, A_pred, seq_meta_list, seq_start_end
-    ]
-    return tuple(out)
+    ])
 
-
-# -----------------------------------------------------------------------------
-# DATASET CLASS
-# -----------------------------------------------------------------------------
 
 class TrajectoryDataset(Dataset):
     """
     DataLoader for Trajectory Datasets (SDD, ETH/UCY).
-    
-    Feature: Lazy Loading / Sharding.
-    Instead of loading the entire dataset into RAM (which crashes on SDD),
-    this class reads pre-processed 'shard' files (.pkl) on demand.
-    
-    Structure:
-    - Preprocessing (mk_splits=True): Reads raw text files, generates graphs, saves 1 PKL per video.
-    - Training (mk_splits=False): Scans all PKL files, builds an index map, loads only required files during __getitem__.
-    
-    Author: me__unpredictable (vishal patel) https://vishalresearch.com
+    Auto-detects mode:
+    - If .pkl files exist in data_dir -> Lazy Load Mode.
+    - If annotations/txt files exist -> Processing Mode (Generate Shards).
     """
     def __init__(
         self, data_dir, obs_len=8, pred_len=8, skip=1, threshold=0.2,
         min_ped=1, delim='\t', norm_lap_matr=True, fill_missing=False, 
-        shuffle=False, n_splits=5, mk_splits=False, dataset_name='', processed_dir='./processed'):
+        shuffle=False, n_splits=5, dataset_name='', processed_dir='./processed'):
         
         super(TrajectoryDataset, self).__init__()
 
@@ -255,33 +199,43 @@ class TrajectoryDataset(Dataset):
         self.min_ped = min_ped
         self.threshold = threshold
 
-        # If not making splits, we assume data is already processed.
-        # We perform Lazy Loading initialization.
-        if not mk_splits:
-            self._init_lazy_loading()
-            return
-
-        # -----------------------------------------------------------
-        # PROCESSING PIPELINE (mk_splits=True)
-        # -----------------------------------------------------------
-        # This section runs once to convert raw text -> sharded PKL files
+        # AUTO-DETECT MODE
+        pkl_files = glob.glob(os.path.join(self.data_dir, "*.pkl"))
         
-        if dataset_name.lower() in ['eth','hotel','univ','zara1','zara2']:
-            self.delim = '\t'
-        elif 'sdd' in dataset_name.lower():
-            self.delim = ' '
+        if len(pkl_files) > 0:
+            # Mode: Lazy Loading (Files already exist)
+            self._init_lazy_loading()
         else:
-            self.delim = delim
+            # Mode: Generate Shards (Raw data provided)
+            # Check if it looks like a raw dataset
+            is_sdd = 'sdd' in dataset_name.lower()
+            if is_sdd and not os.path.exists(os.path.join(data_dir, 'annotations')):
+                 # If explicit check fails, we might just assume it's raw path if user passed it
+                 pass
+            
+            print(f"No .pkl files found in {data_dir}. Scanning for raw data to process...")
+            self._process_raw_data()
+            
+            # NOTE: After processing, this instance is technically "empty" for __getitem__ 
+            # unless we reload. But typically train.py handles the reload. 
+            # We set num_seq=0 to be safe.
+            self.num_seq = 0
 
-        if dataset_name.lower() == 'sdd':
-            if not os.path.exists(os.path.join(data_dir,'annotations')):
+    def _process_raw_data(self):
+        """Processes raw text files and saves them as sharded .pkl files."""
+        if self.dataset_name.lower() in ['eth','hotel','univ','zara1','zara2']:
+            self.delim = '\t'
+        elif 'sdd' in self.dataset_name.lower():
+            self.delim = ' '
+        
+        if self.dataset_name.lower() == 'sdd':
+            if not os.path.exists(os.path.join(self.data_dir,'annotations')):
                 raise ValueError("For SDD dataset, data_dir must be the root directory containing 'annotations' folder.")
             
-            scenes = os.listdir(os.path.join(data_dir, 'annotations'))
-            scenes = [s for s in scenes if os.path.isdir(os.path.join(data_dir, 'annotations', s))]
+            scenes = os.listdir(os.path.join(self.data_dir, 'annotations'))
+            scenes = [s for s in scenes if os.path.isdir(os.path.join(self.data_dir, 'annotations', s))]
             scenes.sort() 
 
-            # Scene Split Logic
             val_scene = [scenes[-1]]
             scenes = scenes[:-1]
             if len(scenes) > 4:
@@ -291,48 +245,35 @@ class TrajectoryDataset(Dataset):
                 test_scene = [scenes[-1]] 
                 train_scene = scenes[:-1]
             
-            splits = {
-                'train': train_scene,
-                'val': val_scene,
-                'test': test_scene
-            }
+            splits = {'train': train_scene, 'val': val_scene, 'test': test_scene}
 
             for s in splits:
                 scenes_in_split = splits[s]
                 print(f"Processing {s} split with {len(scenes_in_split)} scenes.")
-
-                # Create output directory for this split
                 split_out_dir = os.path.join(self.processed_dir, s)
                 os.makedirs(split_out_dir, exist_ok=True)
 
                 for scene_name in scenes_in_split:
-                    current_scene_path = os.path.join(data_dir, 'annotations', scene_name)
+                    current_scene_path = os.path.join(self.data_dir, 'annotations', scene_name)
                     if not os.path.isdir(current_scene_path): continue
                     
                     videos = os.listdir(current_scene_path)
-                    
-                    # Process EVERY video individually to save RAM
                     for v in videos:
                         path = os.path.join(current_scene_path, v, 'annotations.txt')
                         if not os.path.exists(path): continue
                         
-                        meta_id = f"{scene_name}_{v}.pt" # Metadata string
+                        meta_id = f"{scene_name}_{v}.pt"
                         save_name = f"{scene_name}_{v}.pkl"
                         save_path = os.path.join(split_out_dir, save_name)
                         
-                        print(f"Processing Split: {s} | Scene: {scene_name} | Video: {v}")
+                        print(f"Processing: {s} | {scene_name} | {v}")
                         self._process_single_video(path, meta_id, save_path)
 
     def _process_single_video(self, file_path, meta_id, save_path):
-        """
-        Helper function to process one video file and save it immediately.
-        This prevents RAM accumulation.
-        """
-        # 1. Read Data
+        """Helper to process one video and save to disk immediately."""
         if 'sdd' in self.dataset_name.lower():
             raw_data = read_file(file_path, self.delim)
             if raw_data.shape[1] >= 6: 
-                # SDD: [TrackID, xmin, ymin, xmax, ymax, Frame, ..., Label]
                 center_x = (raw_data[:, 1] + raw_data[:, 3]) / 2.0
                 center_y = (raw_data[:, 2] + raw_data[:, 4]) / 2.0
                 track_id = raw_data[:, 0]
@@ -343,13 +284,12 @@ class TrajectoryDataset(Dataset):
         else:
             data = read_file(file_path, self.delim)
         
-        data = data[data[:, 0].argsort()] # Sort by Frame
+        data = data[data[:, 0].argsort()]
         frames = np.unique(data[:, 0]).tolist()
         frame_data = []
         for frame in frames:
             frame_data.append(data[frame == data[:, 0], :])
 
-        # 2. Containers for this video ONLY
         seq_list = []
         seq_list_rel = []
         loss_mask_list = []
@@ -362,19 +302,12 @@ class TrajectoryDataset(Dataset):
         graph_v_pred = []
         graph_a_pred = []
 
-        # 3. Sliding Window
         num_sequences = int(math.ceil((len(frames) - self.seq_len + 1) / self.skip))
-        
-        # RESTORED TQDM HERE
         iterator = tqdm(range(0, num_sequences * self.skip + 1, self.skip), 
-                       total=num_sequences, 
-                       desc=f"Sequences ({meta_id})",
-                       leave=False)
+                       total=num_sequences, desc=f"Seqs", leave=False)
 
         for idx in iterator:
-            # Check bounds
             if idx + self.seq_len > len(frame_data): break
-
             curr_seq_data = np.concatenate(frame_data[idx:idx + self.seq_len], axis=0)
             peds_in_curr_seq = np.unique(curr_seq_data[:, 1])
             
@@ -395,7 +328,6 @@ class TrajectoryDataset(Dataset):
                 if obj_end - obj_front != self.seq_len: continue 
                 if len(curr_obj_seq) != self.seq_len: continue
 
-                # Transpose and extract X,Y
                 curr_obj_seq = np.transpose(curr_obj_seq[:, 2:4]) 
                 rel_curr_obj_seq = np.zeros(curr_obj_seq.shape)
                 rel_curr_obj_seq[:, 1:] = curr_obj_seq[:, 1:] - curr_obj_seq[:, :-1]
@@ -419,7 +351,6 @@ class TrajectoryDataset(Dataset):
                 seq_list.append(s_)
                 seq_list_rel.append(s_rel_)
 
-                # Graph Generation
                 v_o, a_o = seq_to_graph(s_[:, :, :self.obs_len], s_rel_[:, :, :self.obs_len], self.norm_lap_matr)
                 graph_v_obs.append(v_o.clone())
                 graph_a_obs.append(a_o.clone())
@@ -428,7 +359,6 @@ class TrajectoryDataset(Dataset):
                 graph_v_pred.append(v_p.clone())
                 graph_a_pred.append(a_p.clone())
 
-        # 4. Save to Disk
         if len(seq_list) > 0:
             data_dict = {
                 'obs_traj': torch.from_numpy(np.concatenate(seq_list, axis=0)[:, :, :self.obs_len]).type(torch.float),
@@ -447,44 +377,26 @@ class TrajectoryDataset(Dataset):
             with open(save_path, 'wb') as f:
                 pickle.dump(data_dict, f)
             print(f"Saved {save_path} with {len(seq_list)} sequences.")
-        else:
-            print(f"No valid sequences in {meta_id}")
 
-    # -----------------------------------------------------------
-    # LAZY LOADING PIPELINE (mk_splits=False)
-    # -----------------------------------------------------------
     def _init_lazy_loading(self):
-        """
-        Scans the processed directory for PKL files and builds an index map.
-        This allows us to access the dataset as if it were contiguous, while
-        reading from disk on demand.
-        """
-        # Find all .pkl files in the data_dir (e.g. processed/train/*.pkl)
+        """Scans processed directory and builds index."""
         search_path = os.path.join(self.data_dir, "*.pkl")
         self.shard_paths = sorted(glob.glob(search_path))
         
-        if len(self.shard_paths) == 0:
-            raise ValueError(f"No .pkl files found in {self.data_dir}. Did you run with mk_splits=True?")
-
         print(f"Found {len(self.shard_paths)} shards. Building index...")
         
-        self.index_map = [] # [(file_idx, local_idx), ...]
+        self.index_map = [] 
         self.num_seq = 0
         
-        # We need to know how many sequences are in each file to build the map.
         for file_idx, p_path in enumerate(tqdm(self.shard_paths, desc="Indexing")):
             with open(p_path, 'rb') as f:
                 d = pickle.load(f)
                 count = len(d['num_peds_in_seq'])
-                
                 for i in range(count):
                     self.index_map.append((file_idx, i))
-                
                 self.num_seq += count
         
         print(f"Total sequences indexed: {self.num_seq}")
-        
-        # Cache for the currently loaded file
         self.current_file_idx = -1
         self.current_data = None
 
@@ -492,24 +404,14 @@ class TrajectoryDataset(Dataset):
         return self.num_seq
 
     def __getitem__(self, index):
-        """
-        Lazy Load Item.
-        1. Look up which file contains 'index'.
-        2. Load that file (if not already loaded).
-        3. Extract the item.
-        """
         file_idx, local_idx = self.index_map[index]
         
-        # Cache Mechanism: Load file only if it's different from the one in memory
         if self.current_file_idx != file_idx:
             with open(self.shard_paths[file_idx], 'rb') as f:
                 self.current_data = pickle.load(f)
             self.current_file_idx = file_idx
-            
-            # Pre-calculate start indices for this file (for slicing flat tensors)
             self.cum_start_idx = [0] + np.cumsum(self.current_data['num_peds_in_seq']).tolist()
 
-        # Retrieve data from loaded shard
         d = self.current_data
         start = self.cum_start_idx[local_idx]
         end = self.cum_start_idx[local_idx+1]
@@ -532,36 +434,3 @@ class TrajectoryDataset(Dataset):
     @staticmethod
     def collate_fn(batch):
         return seq_collate(batch)
-
-if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--data_dir', type=str, required=True, help='Path to raw data directory')
-    parser.add_argument('--obs_len', type=int, default=8, help='Observation length')
-    parser.add_argument('--pred_len', type=int, default=12, help='Prediction length')
-    parser.add_argument('--skip', type=int, default=1, help='Frame skip rate')
-    parser.add_argument('--threshold', type=float, default=0.2, help='Non-linearity threshold')
-    parser.add_argument('--min_ped', type=int, default=1, help='Minimum pedestrians per sequence')
-    parser.add_argument('--delim', type=str, default='\t', help='Data delimiter')
-    parser.add_argument('--norm_lap_matr', action='store_true', help='Use normalized Laplacian matrix')
-    parser.add_argument('--fill_missing', action='store_true', help='Fill missing data')
-    parser.add_argument('--dataset_name', type=str, default='', help='Name of the dataset (e.g., sdd, eth)')
-    parser.add_argument('--processed_dir', type=str, default='./processed', help='Directory to save processed data')
-    args = parser.parse_args()
-
-    print("Starting data processing...")
-    dataset = TrajectoryDataset(
-        data_dir=args.data_dir,
-        obs_len=args.obs_len,
-        pred_len=args.pred_len,
-        skip=args.skip,
-        threshold=args.threshold,
-        min_ped=args.min_ped,
-        delim=args.delim,
-        norm_lap_matr=args.norm_lap_matr,
-        fill_missing=args.fill_missing,
-        mk_splits=True,
-        dataset_name=args.dataset_name,
-        processed_dir=args.processed_dir
-    )
-    print("Data processing completed.")
