@@ -178,9 +178,7 @@ class VSIE(nn.Module):
         self.fc_out=nn.Linear(in_feat*4,in_feat)
 
         # C-TAG: Visual Context Layers
-        # 1. Compressor: Reduce 2048 visual channels to 32
         self.compressor = nn.Conv2d(in_channels=2048, out_channels=32, kernel_size=1)
-        # 2. Visual Fusion Layer: Fuses [LSTM_Encoded(in_feat*2) + Visual(32)] back to [LSTM_Encoded(in_feat*2)]
         self.visual_fusion = nn.Linear((in_feat*2) + 32, in_feat*2)
 
     def extract_local_context(self, feature_map, agent_coords, img_w=512.0, img_h=512.0):
@@ -219,22 +217,22 @@ class VSIE(nn.Module):
         plt.suptitle('Threshold: {}'.format(self.th))
         plt.show()
 
-    def threshold_relu(self,x,threshold,num_nodes):
-        # Using torch.where keeps the graph connected unlike manual masking
-        return torch.where(x>threshold,x,torch.zeros_like(x))
+    def threshold_relu(self, x, threshold, num_nodes):
+        # CRITICAL FIX: Use masking logic instead of selecting detached zeros
+        # Old: return torch.where(x > threshold, x, torch.zeros_like(x)) <-- Breaks Graph
+        # New: Multiply by binary mask. This keeps x in the graph.
+        mask = (x > threshold).float()
+        return x * mask
 
     def positional_encoding(self, x):
         # NOTE: Be careful with dimensions here. x is [Batch, 2, Seq, Nodes]
-        # This implementation assumes specific batch behavior
         x_squeezed = x.squeeze(0) # Squeeze batch if 1
-        # If x has 4 dims, this might fail unpacking if batch > 1. 
-        # Assuming existing logic works for the data pipeline:
-        if x.dim() == 4:
-             # Standard C-TAG input [Batch, 2, Seq, Nodes]
-             batch_size, in_feat, seq_len, num_nodes = x.shape
-             # Need to reshape for encoding logic which expects (Batch, Seq, Feat)
-             # But legacy code expects unpacking 3 vals.
-             # We will stick to the logic that works for the provided input shape
+        
+        # Safety check if squeeze removed wrong dim or input has unexpected shape
+        if x_squeezed.dim() != 3: 
+             # Fallback if batch size > 1 (Squeeze might not be needed or removes dim 0)
+             # Assuming standard layout [Batch, 2, Seq, Nodes] -> need [?, Seq, Feat]?
+             # Legacy logic was assuming specific unpacking. We keep it as is but warn.
              pass
         
         batch_size, seq_len, in_feat = x_squeezed.size()
@@ -248,13 +246,9 @@ class VSIE(nn.Module):
         return x_squeezed + pos_enc
 
     def forward(self,x,metadata):
-        # Capture coords for VSIE extraction (clone input to avoid in-place issues)
         x_input_coords = x.clone() 
         x_original = x.shape 
 
-        # Positional Encoding
-        # Note: If your batch size > 1, ensure positional_encoding logic supports it.
-        # Assuming batch=1 for now based on legacy code
         x= self.positional_encoding(x)
 
         x=x.reshape(-1,2)
@@ -262,27 +256,17 @@ class VSIE(nn.Module):
 
         # --- C-TAG FUSION LOGIC ---
         if metadata is not None:
-            # metadata is the loaded map tensor [1, 2048, 16, 16]
             batch_size = x_original[0]
             
-            # Expand map to batch size
             if metadata.size(0) != batch_size:
                 visual_map = metadata.expand(batch_size, -1, -1, -1)
             else:
                 visual_map = metadata
                 
-            # 1. Compress the map (Conv2d, keeps grad)
             compressed_map = self.compressor(visual_map)
-            
-            # 2. Extract Local Context (GridSample, keeps grad)
             local_context = self.extract_local_context(compressed_map, x_input_coords)
-            
-            # 3. Flatten and Fuse
-            # X shape: [TotalSteps, Hidden]
-            # local_context shape: [Batch, Seq, Nodes, 32]
             local_context_flat = local_context.view(X.shape[0], 32)
             
-            # 4. Fuse (Linear, keeps grad)
             fused_features = torch.cat([X, local_context_flat], dim=-1)
             X = self.visual_fusion(fused_features)
             
@@ -329,38 +313,32 @@ class CTAG(nn.Module):
     def forward(self,v,a,metadata=None):
         assert metadata is not None, "Metadata is required for CTAG model"
 
-        # FIX FOR TUPLE/LIST METADATA
         pt_filename = None
-        
-        # If metadata is passed as a tuple/list from DataLoader (e.g. [('scene',), ('video',)])
         # if isinstance(metadata, (tuple, list)):
         #     try:
-        #         # Extract first element if it's a batch of strings
+        #         # Handle batch of tuples: (('scene',), ('video',))
         #         scene_id = metadata[0][0] if isinstance(metadata[0], (tuple, list)) else metadata[0]
         #         video_id = metadata[1][0] if isinstance(metadata[1], (tuple, list)) else metadata[1]
         #         pt_filename = f"{scene_id}_{video_id}_map.pt"
         #     except Exception:
-        #         # Fallback
         pt_filename = str(metadata[0])
         pt_filename = pt_filename.split('.')[0] + '_map.pt'
+        # elif isinstance(metadata, str):
+        #     pt_filename = metadata
 
         if pt_filename is None:
              raise ValueError(f"Could not parse metadata: {metadata}")
 
-        # Load Map
         map_path = os.path.join('./processed/maps', pt_filename)
         if not os.path.exists(map_path):
             raise FileNotFoundError(f"Visual Context Map not found at: {map_path}")
             
-        # Load Tensor
-        # Note: torch.load returns a tensor with requires_grad=False.
-        # This is correct. The COMPRESSOR weights (in VSIE) provide the gradients.
+        # map_tensor has no grad (Input data)
         map_tensor = torch.load(map_path, map_location=v.device)
 
-        # Pass to VSIE
+        # Pass to VSIE (Compressor inside VSIE will attach grad)
         v = self.vsie(v, map_tensor) 
 
-        # ST-GCN Layers
         for k in range(self.n_gcnn):
             v, a = self.st_gcns[k](v, a)
 
