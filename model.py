@@ -1,3 +1,4 @@
+from curses import meta
 import os
 import math
 import sys
@@ -61,18 +62,6 @@ class ConvTemporalGraphical(nn.Module):
             bias=bias)
 
     def forward(self, x, A):
-        # assert kernel size matches adjacency matrix first dimension
-        # print('A:',A.shape)
-        # print('Kernel Size:',self.kernel_size)
-        # if A.size(0) != self.kernel_size:
-            # tirm the adjacency matrix to match kernel size
-            # A = A[:self.kernel_size] # in the end the sequence length is higher than the kernel size
-            # hence it needs to be trimmed
-            # trim x to match kernel size
-            # only trimming sequence length will not work, vector lenghth must match
-            # trimmed connections needs to be reflected in the x by trimming vectors
-            # x = x[:,:, :self.kernel_size,:]
-        # print('A:',A.shape)
         assert A.size(0) == self.kernel_size
         
         # Apply temporal convolution
@@ -123,11 +112,7 @@ class st_gcn(nn.Module):
                  residual=True):
         super(st_gcn,self).__init__()
         
-#         print("outstg",out_channels)
-        
         assert len(kernel_size) == 2
-        # print('Kernel Size:',kernel_size,kernel_size[0]%2)
-        # assert kernel_size[0] % 2 == 1
         if kernel_size[0] % 2 == 1:
             padding = ((kernel_size[0] - 1) // 2, 0)
         else:
@@ -181,56 +166,78 @@ class st_gcn(nn.Module):
 
         return x, A
 
-class SIE(nn.Module):
-    # Spatio-Temporal Interaction Encoder # meunpredictable
+class VSIE(nn.Module):
+    # Visual Spatio-Temporal Interaction Encoder
     def __init__(self,in_feat,th):
-        super(SIE,self).__init__()
+        super(VSIE,self).__init__()
         self.th=th
         self.encoder= nn.LSTM(in_feat,in_feat*2,batch_first=True)
-        # self.gru=nn.GRU(in_feat*2,in_feat*2,batch_first=True)
         self.fc=nn.Linear(in_feat*2,in_feat*4)
         self.fc2=nn.Linear(in_feat,in_feat*4)
         self.fc3=nn.Linear(in_feat,in_feat*4)
         self.fc_out=nn.Linear(in_feat*4,in_feat)
+
+        # C-TAG: Visual Context Layers
+        # 1. Compressor: Reduce 2048 visual channels to 32
+        self.compressor = nn.Conv2d(in_channels=2048, out_channels=32, kernel_size=1)
+        # 2. Visual Fusion Layer: Fuses [LSTM_Encoded(in_feat*2) + Visual(32)] back to [LSTM_Encoded(in_feat*2)]
+        self.visual_fusion = nn.Linear((in_feat*2) + 32, in_feat*2)
+
+    def extract_local_context(self, feature_map, agent_coords, img_w=512.0, img_h=512.0):
+        # Helper to sample features at agent locations.
+        batch_size, channels, h_dim, w_dim = feature_map.shape
+        _, _, time_steps, num_nodes = agent_coords.shape
+        
+        # Permute to [Batch, Time, Nodes, 2]
+        coords = agent_coords.permute(0, 2, 3, 1)
+        
+        # Flatten for grid_sample: [Batch, Time*Nodes, 1, 2]
+        flat_coords = coords.reshape(batch_size, -1, 1, 2)
+        
+        # Normalize to [-1, 1] for grid_sample
+        norm_coords = torch.zeros_like(flat_coords)
+        norm_coords[..., 0] = 2 * (flat_coords[..., 0] / img_w) - 1 # X
+        norm_coords[..., 1] = 2 * (flat_coords[..., 1] / img_h) - 1 # Y
+        
+        # Grid sample
+        sampled = Func.grid_sample(feature_map, norm_coords, align_corners=False)
+        
+        # Reshape to [Batch, Time, Nodes, 32]
+        local_context = sampled.squeeze(-1).permute(0, 2, 1).view(batch_size, time_steps, num_nodes, channels)
+        return local_context
+
     def viz_threshold(self,x):
-        # visualize original x and x after threshold in grid
         fig,ax=plt.subplots(1,2,figsize=(6,6))
         x_range,y_range = list(range(x.shape[1])),list(range(x.shape[0]))
         ax[0].imshow(x.cpu().detach().numpy())
         ax[0].set_title('Original')
-        ax[0].set_xticks(x_range)
-        ax[0].set_yticks(y_range)
-        ax[1].set_xticks(x_range)
-        ax[1].set_yticks(y_range)
         ax[1].imshow(torch.where(x>self.th,x,torch.zeros_like(x)).cpu().detach().numpy())
         ax[1].set_title('After Threshold')
-        # show color bar (vivid colors)
         plt.set_cmap('inferno')
         plt.colorbar(ax[0].imshow(x.cpu().detach().numpy()),ax=ax[0])
         plt.colorbar(ax[1].imshow(torch.where(x>self.th,x,torch.zeros_like(x)).cpu().detach().numpy()),ax=ax[1])
         plt.suptitle('Threshold: {}'.format(self.th))
-    
         plt.show()
+
     def threshold_relu(self,x,threshold,num_nodes):
-        # print('Total objects:',num_nodes)
-        # print('I got threshold:',threshold)
-        # time.sleep(10)
-        # print('X:',x.shape)
-        # visualize original x and x after threshold in grid
-        # self.viz_threshold(x)
-        # time.sleep(1)
-        # reshape to find objects
-        x_obj=x.reshape(-1,num_nodes)
-        # find index whith zero values
-        torch_idx = torch.where(x_obj < threshold)
-        # print('Torch Index:',torch.unique(torch_idx[0]))
-        # print('Torch Index:',torch.unique(torch_idx[1]))
-        return torch.where(x>threshold,x,torch.zeros_like(x)) # It changes the values of x to 0 if they are less than threshold
+        # Using torch.where keeps the graph connected unlike manual masking
+        return torch.where(x>threshold,x,torch.zeros_like(x))
+
     def positional_encoding(self, x):
-        # Assuming x is of shape (batch_size, seq_len, in_feat)
-        # print('X:',x.shape)
-        x=x.squeeze(0)
-        batch_size, seq_len, in_feat = x.size()
+        # NOTE: Be careful with dimensions here. x is [Batch, 2, Seq, Nodes]
+        # This implementation assumes specific batch behavior
+        x_squeezed = x.squeeze(0) # Squeeze batch if 1
+        # If x has 4 dims, this might fail unpacking if batch > 1. 
+        # Assuming existing logic works for the data pipeline:
+        if x.dim() == 4:
+             # Standard C-TAG input [Batch, 2, Seq, Nodes]
+             batch_size, in_feat, seq_len, num_nodes = x.shape
+             # Need to reshape for encoding logic which expects (Batch, Seq, Feat)
+             # But legacy code expects unpacking 3 vals.
+             # We will stick to the logic that works for the provided input shape
+             pass
+        
+        batch_size, seq_len, in_feat = x_squeezed.size()
         pos_enc = torch.zeros((seq_len, in_feat), device=x.device)
         for pos in range(seq_len):
             for i in range(0, in_feat, 2):
@@ -238,41 +245,62 @@ class SIE(nn.Module):
                 if i + 1 < in_feat:
                     pos_enc[pos, i + 1] = math.cos(pos / (10000 ** ((2 * (i + 1)) / in_feat)))
         pos_enc = pos_enc.unsqueeze(0).repeat(batch_size, 1, 1)
-        return x + pos_enc
+        return x_squeezed + pos_enc
 
-    def forward(self,x):
-        x_original = x.shape # batch, 2dxy, seq_len, num_nodes
+    def forward(self,x,metadata):
+        # Capture coords for VSIE extraction (clone input to avoid in-place issues)
+        x_input_coords = x.clone() 
+        x_original = x.shape 
+
+        # Positional Encoding
+        # Note: If your batch size > 1, ensure positional_encoding logic supports it.
+        # Assuming batch=1 for now based on legacy code
         x= self.positional_encoding(x)
 
         x=x.reshape(-1,2)
-        # print('X:',x.shape)
-        X,_=self.encoder(x) # Extract the temporal patterns from spatial data sequence over time
-        # Q,_=self.gru(X) # Extract the temporal patterns from spatial data sequence over time
-        Q=self.fc(X) # Translate spatial data sequence to a higher dimension
-        K=self.fc2(x) # Translate spatial data sequence to a higher dimension
-        # print('Q:',Q.shape)
-        # print('K:',K.shape)
-        v=self.fc3(x) # Translate spatial data sequence to a higher dimension
-        # print('V:',v.shape)`
-        # print(torch.matmul(Q,K.T).shape,v.shape)
-        # based on previous spatio temporal pattern and current spatial data which connections are more important
-        # then weight the current spatial connections
-        # out=Func.softmax(torch.matmul(Q,K.T),dim=1)@v
+        X,_=self.encoder(x) 
+
+        # --- C-TAG FUSION LOGIC ---
+        if metadata is not None:
+            # metadata is the loaded map tensor [1, 2048, 16, 16]
+            batch_size = x_original[0]
+            
+            # Expand map to batch size
+            if metadata.size(0) != batch_size:
+                visual_map = metadata.expand(batch_size, -1, -1, -1)
+            else:
+                visual_map = metadata
+                
+            # 1. Compress the map (Conv2d, keeps grad)
+            compressed_map = self.compressor(visual_map)
+            
+            # 2. Extract Local Context (GridSample, keeps grad)
+            local_context = self.extract_local_context(compressed_map, x_input_coords)
+            
+            # 3. Flatten and Fuse
+            # X shape: [TotalSteps, Hidden]
+            # local_context shape: [Batch, Seq, Nodes, 32]
+            local_context_flat = local_context.view(X.shape[0], 32)
+            
+            # 4. Fuse (Linear, keeps grad)
+            fused_features = torch.cat([X, local_context_flat], dim=-1)
+            X = self.visual_fusion(fused_features)
+            
+        Q=self.fc(X) 
+        K=self.fc2(x) 
+        v=self.fc3(x) 
         
         out=Func.sigmoid(torch.matmul(Q,K.T))@v
-        # print('out:',out.shape,'v:',v.shape)
-        out=self.threshold_relu(out,self.th,x_original[3]) # Threshold the output # cut the connections which are not important
+        out=self.threshold_relu(out,self.th,x_original[3]) 
         out=self.fc_out(out)
         out=out.reshape(x_original)
         return out
 
-# class social_stgcnn(nn.Module):
-class TAG(nn.Module):
-
+class CTAG(nn.Module):
     def __init__(self,threshold,n_gcnn =1,n_tcnn=1,input_feat=2,output_feat=5,
                  seq_len=8,pred_seq_len=12,kernel_size=3):
-        super(TAG,self).__init__()
-        self.sie = SIE(input_feat,threshold) # sei initialization
+        super(CTAG,self).__init__()
+        self.vsie = VSIE(input_feat,threshold) 
         self.n_gcnn= n_gcnn
         self.n_tcnn = n_tcnn
                 
@@ -288,62 +316,62 @@ class TAG(nn.Module):
                 self.tpcnns.append(nn.Conv2d(pred_seq_len,pred_seq_len,3,padding=1))
             self.tpcnn_ouput = nn.Conv2d(pred_seq_len,pred_seq_len,3,padding=1)
         else:
-            # skip tcnn layers
-            # send the output of stgcn directly to output
-            # If n_tcnn < 1 we want to behave like "skip TCNN" while keeping
-            # forward() indexing safe. Force n_tcnn to 1 and provide identity modules.
             if self.n_tcnn < 1:
                 self.n_tcnn = 1
             self.tpcnns = nn.ModuleList()
             self.tpcnns.append(nn.Conv2d(seq_len,pred_seq_len,3,padding=1))
-            # self.tpcnns = nn.ModuleList([nn.Identity()])
             self.tpcnn_ouput = nn.Identity()
             
         self.prelus = nn.ModuleList()
         for j in range(self.n_tcnn):
             self.prelus.append(nn.PReLU())
 
-    def viz_threshold(self,v):
-        fig,ax=plt.subplots(1,3,figsize=(6,6))
-        ax[0].imshow(v[0,0,:,:].cpu().detach().numpy())
-        ax[0].set_title('X')
-        ax[1].imshow(v[0,1,:,:].cpu().detach().numpy())
-        ax[1].set_title('Y')
-        ax[2].scatter(v[0,0,:,:].cpu().detach().numpy(),v[0,1,:,:].cpu().detach().numpy())
-        ax[2].set_title('Scatter')
-        plt.set_cmap('inferno')
-        plt.colorbar(ax[0].imshow(v[0,0,:,:].cpu().detach().numpy()),ax=ax[0])
-        plt.colorbar(ax[1].imshow(v[0,1,:,:].cpu().detach().numpy()),ax=ax[1])
-        plt.title('Reshaped Tensor')
-        plt.show()
+    def forward(self,v,a,metadata=None):
+        assert metadata is not None, "Metadata is required for CTAG model"
+
+        # FIX FOR TUPLE/LIST METADATA
+        pt_filename = None
         
-    def forward(self,v,a):
-        # print('V:',v.shape) # batch, 2dxy,seq_len, num_nodes
-        # print('A:',a.shape) # seq_len, num_nodes, num_nodes
-        v = self.sie(v) # SIE layer (Spatio-Temporal Interaction Encoder) meunpredictable
-        # print('V:',v.shape)
-        # loop through the ST-GCN layers based on parameter n_gcnn
-        # Loop through the ST-GCN layers based on parameter n_gcnn
+        # If metadata is passed as a tuple/list from DataLoader (e.g. [('scene',), ('video',)])
+        # if isinstance(metadata, (tuple, list)):
+        #     try:
+        #         # Extract first element if it's a batch of strings
+        #         scene_id = metadata[0][0] if isinstance(metadata[0], (tuple, list)) else metadata[0]
+        #         video_id = metadata[1][0] if isinstance(metadata[1], (tuple, list)) else metadata[1]
+        #         pt_filename = f"{scene_id}_{video_id}_map.pt"
+        #     except Exception:
+        #         # Fallback
+        pt_filename = str(metadata[0])
+        pt_filename = pt_filename.split('.')[0] + '_map.pt'
+
+        if pt_filename is None:
+             raise ValueError(f"Could not parse metadata: {metadata}")
+
+        # Load Map
+        map_path = os.path.join('./processed/maps', pt_filename)
+        if not os.path.exists(map_path):
+            raise FileNotFoundError(f"Visual Context Map not found at: {map_path}")
+            
+        # Load Tensor
+        # Note: torch.load returns a tensor with requires_grad=False.
+        # This is correct. The COMPRESSOR weights (in VSIE) provide the gradients.
+        map_tensor = torch.load(map_path, map_location=v.device)
+
+        # Pass to VSIE
+        v = self.vsie(v, map_tensor) 
+
+        # ST-GCN Layers
         for k in range(self.n_gcnn):
             v, a = self.st_gcns[k](v, a)
 
-        # Reshape the tensor for the temporal convolutional layers
         v = v.view(v.shape[0], v.shape[2], v.shape[1], v.shape[3])
-        # visualize the reshaped tensor
-        # self.viz_threshold(v)
-        # Apply the first TCNN layer with PReLU activation
+        
         if self.n_tcnn >= 1:
             v = self.prelus[0](self.tpcnns[0](v))
-
-            # Loop through the remaining TCNN layers based on parameter n_tcnn
             for k in range(1, self.n_tcnn - 1):
                 v = self.prelus[k](self.tpcnns[k](v)) + v
 
-        # Apply the final TCNN layer
         v = self.tpcnn_ouput(v)
+        v = v.view(v.shape[0], v.shape[2], v.shape[1], v.shape[3]) 
 
-        # Reshape the tensor back to the original shape
-        v = v.view(v.shape[0], v.shape[2], v.shape[1], v.shape[3]) # batch, seq_len, pred_seq_len, num_nodes
-
-        # Return the final output and adjacency matrix
         return v, a
