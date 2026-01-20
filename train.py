@@ -173,7 +173,11 @@ def train(epoch, model, optimizer, loader_train, metrics):
         batch_count += 1
 
         # 1. Unpack 
-        batch_tensors = batch[:-2] 
+        batch_tensors = batch[:-2] # Slice off metadata
+        # print("Batch tensors length:", len(batch_tensors))
+        # print('Batch metadata:', batch[-2], batch[-1]) # batch[-1] shows size of each sequence in the batch
+        batch_metadata = batch[-2:][0] # it returns a tubple with feature map pt file name hence selecting [0]
+        
         batch = [tensor.cuda() for tensor in batch_tensors]
         
         obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr = batch
@@ -185,7 +189,7 @@ def train(epoch, model, optimizer, loader_train, metrics):
         optimizer.zero_grad()
         V_obs_tmp = V_obs.permute(0, 3, 1, 2)
         
-        V_pred, _ = model(V_obs_tmp, A_obs) 
+        V_pred, _ = model(V_obs_tmp, A_obs,batch_metadata) 
         
         V_pred = V_pred.permute(0, 2, 3, 1)
         V_pred = V_pred.squeeze(0)
@@ -237,14 +241,18 @@ def vald(epoch, model, loader_val, metrics, constant_metrics):
         for cnt, batch in enumerate(pbar): 
             batch_count += 1
 
-            batch_tensors = batch[:-2]
+            batch_tensors = batch[:-2] # Slice off metadata
+            # print("Batch tensors length:", len(batch_tensors))
+            # print('Batch metadata:', batch[-2], batch[-1]) # batch[-1] shows size of each sequence in the batch
+            batch_metadata = batch[-2:][0] # it returns a tubple with feature map pt file name hence selecting [0]
+            
             batch = [tensor.cuda() for tensor in batch_tensors]
             obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr = batch
 
             V_obs = V_obs.unsqueeze(0)
             V_obs_tmp = V_obs.permute(0, 3, 1, 2)
             
-            V_pred, _ = model(V_obs_tmp, A_obs)
+            V_pred, _ = model(V_obs_tmp, A_obs,batch_metadata)
             V_pred = V_pred.permute(0, 2, 3, 1)
             V_pred = V_pred.squeeze(0)
             
@@ -283,13 +291,14 @@ def calculate_ade_fde(model, loader_val):
     with torch.no_grad():
         for batch in pbar:
             batch_tensors = batch[:-2]
+            batch_metadata = batch[-2:][0]
             batch = [tensor.cuda() for tensor in batch_tensors]
             obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr = batch
 
             V_obs = V_obs.unsqueeze(0)
             V_obs_tmp = V_obs.permute(0, 3, 1, 2)
             
-            V_pred, _ = model(V_obs_tmp, A_obs)
+            V_pred, _ = model(V_obs_tmp, A_obs,batch_metadata)
             V_pred = V_pred.permute(0, 2, 3, 1)
             V_pred = V_pred.squeeze(0)
 
