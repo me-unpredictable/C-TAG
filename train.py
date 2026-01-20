@@ -138,7 +138,7 @@ print('Data loaded.')
 # -----------------------------------------------------------------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-model = TAG(
+model = CTAG(
     n_gcnn=args.n_gcnn,
     n_tcnn=args.n_tcnn,
     output_feat=args.output_size,
