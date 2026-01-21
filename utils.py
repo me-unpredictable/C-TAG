@@ -3,8 +3,11 @@ utils.py
 
 Description: 
     Utilities for trajectory dataset loading, preprocessing, and batching.
-    Implements a "Lazy Loading" strategy to handle large datasets (like SDD) 
-    that exceed RAM capacity by processing video-by-video and sharding the output.
+    Features:
+    - Vectorized Graph Generation (Fast)
+    - Padding Collation (Enables Batch_Size > 1)
+    - Correct Metadata Naming (Matches map_utils.py)
+    - Lazy Loading (Handles large datasets like SDD)
 
 Author: me__unpredictable (vishal patel) https://vishalresearch.com
 """
@@ -27,8 +30,33 @@ def anorm(p1, p2):
     if NORM == 0:
         return 0
     return 1 / (NORM)
+
+def normalize_adj_dense(mx):
+    """
+    Row-normalize dense matrix (Symmetrical Normalization for GCN).
+    Formula: D^{-0.5} * A * D^{-0.5}
+    """
+    # Add self-loops (Identity matrix)
+    mx = mx + np.eye(mx.shape[0])
+    
+    # Calculate degree matrix D
+    rowsum = np.array(mx.sum(1))
+    
+    # Inverse square root of degree
+    r_inv = np.power(rowsum, -0.5).flatten()
+    r_inv[np.isinf(r_inv)] = 0.
+    r_mat_inv = np.diag(r_inv)
+    
+    # D^{-0.5} * A * D^{-0.5}
+    mx = r_mat_inv.dot(mx).dot(r_mat_inv)
+    return mx
                 
 def seq_to_graph(seq_, seq_rel, norm_lap_matr=True):
+    """
+    Vectorized version of graph construction.
+    seq_: [Num_Nodes, 2, Seq_Len]
+    seq_rel: [Num_Nodes, 2, Seq_Len]
+    """
     if torch.is_tensor(seq_):
         seq_np = seq_.detach().cpu().numpy()
         seq_rel_np = seq_rel.detach().cpu().numpy()
@@ -46,24 +74,26 @@ def seq_to_graph(seq_, seq_rel, norm_lap_matr=True):
     V = np.zeros((seq_len, num_nodes, 2))
     A = np.zeros((seq_len, num_nodes, num_nodes))
 
+    # --- VECTORIZED LOOP OVER TIME ---
     for s in range(seq_len):
         V[s, :, :] = seq_rel_np[:, :, s]
-        pos_s = seq_np[:, :, s]
+        pos_s = seq_np[:, :, s] # [N, 2]
         
+        # Broadcasting for Pairwise Differences [N, N, 2]
         diff = pos_s[:, np.newaxis, :] - pos_s[np.newaxis, :, :]
-        dists = np.linalg.norm(diff, axis=2)
+        dists = np.linalg.norm(diff, axis=2) # [N, N]
 
+        # Inverse Distance (Adjacency)
         with np.errstate(divide='ignore', invalid='ignore'):
             adj_mat = np.zeros_like(dists)
             mask = dists != 0
             adj_mat[mask] = 1.0 / dists[mask]
         
-        np.fill_diagonal(adj_mat, 1)
+        # Self-loops handled by normalization logic
+        np.fill_diagonal(adj_mat, 0)
 
         if norm_lap_matr:
-            G = nx.from_numpy_array(adj_mat)
-            lap = nx.normalized_laplacian_matrix(G).toarray()
-            A[s, :, :] = lap
+            A[s, :, :] = normalize_adj_dense(adj_mat)
         else:
             A[s, :, :] = adj_mat
 
@@ -127,45 +157,69 @@ def read_file(_path, delim='\t'):
 
 def seq_collate(data):
     """
-    Custom collate function to handle batches of sequences with 
-    variable numbers of pedestrians.
+    Pads sequences to enable [Batch, Max_Agents, ...] shape.
+    This allows batch_size > 1 in C-TAG.
     """
     (obs_seq_list, pred_seq_list, obs_seq_rel_list, pred_seq_rel_list,
      non_linear_ped_list, loss_mask_list, v_obs_list, A_obs_list,
      v_pred_list, A_pred_list, seq_meta_list) = zip(*data)
 
-    _len = [len(seq) for seq in obs_seq_list]
-    cum_start_idx = [0] + np.cumsum(_len).tolist()
-    seq_start_end = [[start, end] for start, end in zip(cum_start_idx, cum_start_idx[1:])]
+    # 1. Find Max Agents in this batch by checking dim 1 of v_obs
+    max_agents = max([x.shape[1] for x in v_obs_list])
+    
+    # Helper to pad (N, 2, T) tensors -> Pad N (dim 0)
+    def pad_N(tensor, N_target):
+        N, D, T = tensor.shape
+        pad_amt = N_target - N
+        if pad_amt == 0: return tensor
+        return torch.cat([tensor, torch.zeros(pad_amt, D, T)], dim=0)
 
-    # Concatenate all into one big batch tensor
-    obs_traj = torch.cat(obs_seq_list, dim=0)
-    pred_traj = torch.cat(pred_seq_list, dim=0)
-    obs_traj_rel = torch.cat(obs_seq_rel_list, dim=0)
-    pred_traj_rel = torch.cat(pred_seq_rel_list, dim=0)
+    # Helper for Graphs: Pad V (T, N, 2)
+    def pad_V(tensor, N_target):
+        T, N, D = tensor.shape
+        pad_amt = N_target - N
+        if pad_amt == 0: return tensor
+        return torch.cat([tensor, torch.zeros(T, pad_amt, D)], dim=1)
+
+    # Helper for Adjacency: Pad A (T, N, N)
+    def pad_A(tensor, N_target):
+        T, N, _ = tensor.shape
+        pad = N_target - N
+        if pad == 0: return tensor
+        # Pad columns
+        tensor = torch.cat([tensor, torch.zeros(T, N, pad)], dim=2)
+        # Pad rows
+        tensor = torch.cat([tensor, torch.zeros(T, pad, N + pad)], dim=1)
+        return tensor
+
+    # Helper for Loss Mask (N, T)
+    def pad_mask(tensor, N_target):
+        N, T = tensor.shape
+        pad = N_target - N
+        if pad == 0: return tensor
+        return torch.cat([tensor, torch.zeros(pad, T)], dim=0)
+    
+    # Apply Padding
+    obs_traj = torch.stack([pad_N(x, max_agents) for x in obs_seq_list])
+    pred_traj = torch.stack([pad_N(x, max_agents) for x in pred_seq_list])
+    obs_traj_rel = torch.stack([pad_N(x, max_agents) for x in obs_seq_rel_list])
+    pred_traj_rel = torch.stack([pad_N(x, max_agents) for x in pred_seq_rel_list])
+    
+    # Graph Tensors
+    v_obs = torch.stack([pad_V(x, max_agents) for x in v_obs_list])
+    v_pred = torch.stack([pad_V(x, max_agents) for x in v_pred_list])
+    A_obs = torch.stack([pad_A(x, max_agents) for x in A_obs_list])
+    A_pred = torch.stack([pad_A(x, max_agents) for x in A_pred_list])
+    
+    loss_mask = torch.stack([pad_mask(x, max_agents) for x in loss_mask_list])
+    
+    # Non-linear (Just cat, it's a flat list effectively)
     non_linear_ped = torch.cat(non_linear_ped_list, dim=0)
-    loss_mask = torch.cat(loss_mask_list, dim=0)
-    
-    v_obs = torch.cat(v_obs_list, dim=1) 
-    v_pred = torch.cat(v_pred_list, dim=1)
-    
-    # Create Block Diagonal Adjacency Matrix
-    total_nodes = sum(_len)
-    T_obs = A_obs_list[0].shape[0]
-    T_pred = A_pred_list[0].shape[0]
-    
-    A_obs = torch.zeros(T_obs, total_nodes, total_nodes)
-    A_pred = torch.zeros(T_pred, total_nodes, total_nodes)
-    
-    curr_idx = 0
-    for i, n_nodes in enumerate(_len):
-        A_obs[:, curr_idx:curr_idx+n_nodes, curr_idx:curr_idx+n_nodes] = A_obs_list[i]
-        A_pred[:, curr_idx:curr_idx+n_nodes, curr_idx:curr_idx+n_nodes] = A_pred_list[i]
-        curr_idx += n_nodes
 
+    # Return structured batch
     return tuple([
         obs_traj, pred_traj, obs_traj_rel, pred_traj_rel, non_linear_ped,
-        loss_mask, v_obs, A_obs, v_pred, A_pred, seq_meta_list, seq_start_end
+        loss_mask, v_obs, A_obs, v_pred, A_pred, seq_meta_list
     ])
 
 
@@ -207,18 +261,8 @@ class TrajectoryDataset(Dataset):
             self._init_lazy_loading()
         else:
             # Mode: Generate Shards (Raw data provided)
-            # Check if it looks like a raw dataset
-            is_sdd = 'sdd' in dataset_name.lower()
-            if is_sdd and not os.path.exists(os.path.join(data_dir, 'annotations')):
-                 # If explicit check fails, we might just assume it's raw path if user passed it
-                 pass
-            
             print(f"No .pkl files found in {data_dir}. Scanning for raw data to process...")
             self._process_raw_data()
-            
-            # NOTE: After processing, this instance is technically "empty" for __getitem__ 
-            # unless we reload. But typically train.py handles the reload. 
-            # We set num_seq=0 to be safe.
             self.num_seq = 0
 
     def _process_raw_data(self):
@@ -262,7 +306,8 @@ class TrajectoryDataset(Dataset):
                         path = os.path.join(current_scene_path, v, 'annotations.txt')
                         if not os.path.exists(path): continue
                         
-                        meta_id = f"{scene_name}_{v}.pt"
+                        # CORRECTION HERE: Match map_utils.py naming convention
+                        meta_id = f"{scene_name}_{v}_map.pt" 
                         save_name = f"{scene_name}_{v}.pkl"
                         save_path = os.path.join(split_out_dir, save_name)
                         

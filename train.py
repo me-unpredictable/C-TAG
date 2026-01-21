@@ -127,7 +127,7 @@ if not args.skip_val:
         dset_val,
         batch_size=1,
         shuffle=False,
-        num_workers=1,
+        num_workers=0,
         collate_fn=TrajectoryDataset.collate_fn
     )
 
@@ -173,17 +173,15 @@ def train(epoch, model, optimizer, loader_train, metrics):
         batch_count += 1
 
         # 1. Unpack 
-        batch_tensors = batch[:-2] # Slice off metadata
+        batch_tensors = batch[:-1] # Slice off metadata
         # print("Batch tensors length:", len(batch_tensors))
-        # print('Batch metadata:', batch[-2], batch[-1]) # batch[-1] shows size of each sequence in the batch
-        batch_metadata = batch[-2:][0] # it returns a tubple with feature map pt file name hence selecting [0]
+        # print('Batch metadata:', batch[-1]) # batch[-1] shows size of each sequence in the batch
+        batch_metadata = batch[-1][0] # it returns a tubple with feature map pt file name hence selecting [0]
         
         batch = [tensor.cuda() for tensor in batch_tensors]
         
         obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr = batch
 
-        # 2. Fix Dimensions
-        V_obs = V_obs.unsqueeze(0) 
 
         # 3. Forward
         optimizer.zero_grad()
@@ -192,7 +190,7 @@ def train(epoch, model, optimizer, loader_train, metrics):
         V_pred, _ = model(V_obs_tmp, A_obs,batch_metadata) 
         
         V_pred = V_pred.permute(0, 2, 3, 1)
-        V_pred = V_pred.squeeze(0)
+        
 
         # 4. Loss
         l = graph_loss(V_pred, V_tr)
@@ -241,20 +239,19 @@ def vald(epoch, model, loader_val, metrics, constant_metrics):
         for cnt, batch in enumerate(pbar): 
             batch_count += 1
 
-            batch_tensors = batch[:-2] # Slice off metadata
+            batch_tensors = batch[:-1] # Slice off metadata
             # print("Batch tensors length:", len(batch_tensors))
-            # print('Batch metadata:', batch[-2], batch[-1]) # batch[-1] shows size of each sequence in the batch
-            batch_metadata = batch[-2:][0] # it returns a tubple with feature map pt file name hence selecting [0]
+            # print('Batch metadata:', batch[-1]) # batch[-1] shows size of each sequence in the batch
+            batch_metadata = batch[-1][0] # it returns a tubple with feature map pt file name hence selecting [0]
             
             batch = [tensor.cuda() for tensor in batch_tensors]
             obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr = batch
 
-            V_obs = V_obs.unsqueeze(0)
             V_obs_tmp = V_obs.permute(0, 3, 1, 2)
             
             V_pred, _ = model(V_obs_tmp, A_obs,batch_metadata)
             V_pred = V_pred.permute(0, 2, 3, 1)
-            V_pred = V_pred.squeeze(0)
+            
             
             l = graph_loss(V_pred, V_tr)
 
@@ -290,17 +287,15 @@ def calculate_ade_fde(model, loader_val):
 
     with torch.no_grad():
         for batch in pbar:
-            batch_tensors = batch[:-2]
-            batch_metadata = batch[-2:][0]
+            batch_tensors = batch[:-1]
+            batch_metadata = batch[-1][0]
             batch = [tensor.cuda() for tensor in batch_tensors]
             obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr = batch
 
-            V_obs = V_obs.unsqueeze(0)
             V_obs_tmp = V_obs.permute(0, 3, 1, 2)
             
             V_pred, _ = model(V_obs_tmp, A_obs,batch_metadata)
             V_pred = V_pred.permute(0, 2, 3, 1)
-            V_pred = V_pred.squeeze(0)
 
             pred = [V_pred.cpu().numpy()]
             target = [V_tr.cpu().numpy()]

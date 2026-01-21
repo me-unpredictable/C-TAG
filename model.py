@@ -321,8 +321,8 @@ class CTAG(nn.Module):
         #         video_id = metadata[1][0] if isinstance(metadata[1], (tuple, list)) else metadata[1]
         #         pt_filename = f"{scene_id}_{video_id}_map.pt"
         #     except Exception:
-        pt_filename = str(metadata[0])
-        pt_filename = pt_filename.split('.')[0] + '_map.pt'
+        pt_filename = str(metadata)
+        # pt_filename = pt_filename.split('.')[0] + '_map.pt'
         # elif isinstance(metadata, str):
         #     pt_filename = metadata
 
