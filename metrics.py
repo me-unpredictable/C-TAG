@@ -133,12 +133,12 @@ def bivariate_loss_old(V_pred,V_trgt):
 def bivariate_loss(V_pred, V_trgt):
     # mux, muy, sx, sy, corr
     # assert V_pred.shape == V_trgt.shape
-    normx = V_trgt[:, :, 0] - V_pred[:, :, 0]
-    normy = V_trgt[:, :, 1] - V_pred[:, :, 1]
+    normx = V_trgt[..., 0] - V_pred[..., 0]
+    normy = V_trgt[..., 1] - V_pred[..., 1]
 
-    sx = torch.exp(V_pred[:, :, 2])  # sigma x
-    sy = torch.exp(V_pred[:, :, 3])  # sigma y
-    corr = torch.tanh(V_pred[:, :, 4])  # corr
+    sx = torch.exp(V_pred[..., 2])  # sigma x
+    sy = torch.exp(V_pred[..., 3])  # sigma y
+    corr = torch.tanh(V_pred[..., 4])  # corr
 
     sxsy = sx * sy
 
@@ -161,6 +161,6 @@ def bivariate_loss(V_pred, V_trgt):
 
     # Ensure the loss is non NaN
     if torch.isnan(result):
-        result = torch.tensor(0.0).to(V_pred.device)
+        result = torch.tensor(0.0, device=V_pred.device, requires_grad=True)
     
     return result

@@ -62,8 +62,6 @@ class ConvTemporalGraphical(nn.Module):
             bias=bias)
 
     def forward(self, x, A):
-        assert A.size(0) == self.kernel_size
-        
         # Apply temporal convolution
         x = self.conv(x)
         
@@ -73,7 +71,11 @@ class ConvTemporalGraphical(nn.Module):
         x = x.reshape(n * t, c, v)  # [n*t, c, v]
         
         # Apply adjacency matrix A - we reshape and use batch matmul
-        x = torch.matmul(x, A.view(self.kernel_size, v, v))  # [n*t, c, v]
+        if A.dim() == 4:
+            x = torch.matmul(x, A.view(n * t, v, v))
+        else:
+             assert A.size(0) == self.kernel_size
+             x = torch.matmul(x, A.view(self.kernel_size, v, v))  # [n*t, c, v]
         
         # Reshape back to original format
         x = x.view(n, t, c, v)
