@@ -199,7 +199,7 @@ def train(epoch, model, optimizer, loader_train, metrics):
             loss = l
             is_fst_loss = False
         else:
-            loss += l
+            loss = loss + l
 
         # 5. Backprop (Gradient Accumulation)
         turn_point = int(loader_len / args.batch_size) * args.batch_size + loader_len % args.batch_size - 1
@@ -259,7 +259,7 @@ def vald(epoch, model, loader_val, metrics, constant_metrics):
                 loss = l
                 is_fst_loss = False
             else:
-                loss += l
+                loss = loss + l
             
             turn_point = int(loader_len / args.batch_size) * args.batch_size + loader_len % args.batch_size - 1
             
