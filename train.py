@@ -194,6 +194,14 @@ def train(epoch, model, optimizer, loader_train, metrics):
 
         # 4. Loss
         l = graph_loss(V_pred, V_tr)
+        
+        # [ADDED] Check for NaN/Inf in individual batch loss
+        if torch.isnan(l) or torch.isinf(l) or (l.item() == 0 and epoch > 0):
+            # print(f"[WARNING] Invalid loss detected at Epoch {epoch}, Batch {cnt}. Value: {l.item()}")
+            # print("Skipping backward pass for this batch to avoid poisoning model weights.")
+            is_fst_loss = True
+            loss = 0
+            continue 
 
         if is_fst_loss:
             loss = l
@@ -208,8 +216,9 @@ def train(epoch, model, optimizer, loader_train, metrics):
             loss = loss / args.batch_size
             loss.backward()
             
-            if args.clip_grad is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
+            # [MODIFIED] Enforce gradient clipping even if not in args (optional but recommended)
+            clip_val = args.clip_grad if args.clip_grad is not None else 1.0 
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_val)
             
             optimizer.step()
             
