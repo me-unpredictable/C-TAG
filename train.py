@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm  # [ADDED] For progress bars
 
 from model import CTAG
-from utils import TrajectoryDataset
+from utils_by_scene import TrajectoryDataset
 from metrics import *#ade_loss, fde_loss, bivariate_loss
 
 parser = argparse.ArgumentParser()
@@ -30,6 +30,7 @@ parser.add_argument('--thres', type=float, default=0.3, help='Threshold to make 
 parser.add_argument('--obs_seq_len', type=int, default=8)
 parser.add_argument('--pred_seq_len', type=int, default=12)
 parser.add_argument('--dataset', default='eth', help='Apolloscape,eth,hotel,univ,zara1,zara2,SDD')
+parser.add_argument('--scene_name', default='bookstore', help='Scene name to train on [quad,nexus,little,hyang,gates,deathCircle,coupa,bookstore]')
 
 # Training specific parameters
 parser.add_argument('--batch_size', type=int, default=512, help='minibatch size (Virtual Batch Size for Gradient Accumulation)')
@@ -73,14 +74,15 @@ def graph_loss(V_pred, V_target):
 # -----------------------------------------------------------------------------
 # DATASET INITIALIZATION
 # -----------------------------------------------------------------------------
-processed_train_dir = './processed/train'
-processed_val_dir = './processed/val'
+processed_train_dir = os.path.join('./processed/train', args.scene_name)
+processed_val_dir = os.path.join('./processed/val', args.scene_name)
 
-# Check if processed data exists
+# Check if processed data exists for this scene
 files_exist = os.path.exists(processed_train_dir) and len(glob.glob(os.path.join(processed_train_dir, "*.pkl"))) > 0
 
 if args.reload_data or not files_exist:
-    print("Processed data missing or reload requested. Generating splits from RAW data...")
+    print(f"Processed data for {args.scene_name} missing or reload requested. Generating splits from RAW data...")
+    # This generates ALL scenes into ./processed
     _ = TrajectoryDataset(
         data_dir=args.dataset_path,
         obs_len=args.obs_seq_len,
@@ -92,7 +94,7 @@ if args.reload_data or not files_exist:
     )
     print("Data generation complete.")
 
-print("Initializing Datasets (Lazy Loading)...")
+print(f"Initializing Datasets for Scene: {args.scene_name}...")
 
 dset_train = TrajectoryDataset(
     data_dir=processed_train_dir,
@@ -306,12 +308,39 @@ def calculate_ade_fde(model, loader_val):
             V_pred, _ = model(V_obs_tmp, A_obs,batch_metadata)
             V_pred = V_pred.permute(0, 2, 3, 1)
 
-            pred = [V_pred.cpu().numpy()]
-            target = [V_tr.cpu().numpy()]
-            count = [V_tr.size(0)]
+            # --- FIX: Unpack Batch for ADE/FDE calculation ---
+            batch_size = V_pred.shape[0]
+            pred_list = []
+            target_list = []
+            count_list = []
+            
+            V_pred_np = V_pred.cpu().numpy()
+            V_tr_np = V_tr.cpu().numpy()
+            loss_mask_np = loss_mask.cpu().numpy() # (B, N, T)
+            
+            for i in range(batch_size):
+                # Determine number of valid agents in this sequence
+                # loss_mask[i] is (N, T). Valid agents have non-zero entries (or we assume count from data loading)
+                # Simple heuristic: Count rows that are not all zeros (or consistent with valid mask)
+                # Since pad_mask appends zeros, we can just find the split point.
+                # However, loss_mask might be all 1s for valid and 0s for pad.
+                # Let's count agents with at least one valid time step.
+                valid_rows = np.any(loss_mask_np[i] > 0, axis=1)
+                num_valid = np.sum(valid_rows)
+                
+                if num_valid == 0: num_valid = 1 # Fallback
+                
+                # Extract valid part and only (x, y) coords
+                # V_pred is (B, T, N, 5). We take first 2 channels.
+                p_i = V_pred_np[i, :, :num_valid, :2] # (T, num_valid, 2)
+                t_i = V_tr_np[i, :, :num_valid, :2]   # (T, num_valid, 2)
+                
+                pred_list.append(p_i)
+                target_list.append(t_i)
+                count_list.append(num_valid)
 
-            ade_ls.append(ade(pred, target, count))
-            fde_ls.append(fde(pred, target, count))
+            ade_ls.append(ade(pred_list, target_list, count_list))
+            fde_ls.append(fde(pred_list, target_list, count_list))
 
     return np.mean(ade_ls), np.mean(fde_ls)
 
