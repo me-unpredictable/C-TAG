@@ -130,37 +130,57 @@ def bivariate_loss_old(V_pred,V_trgt):
     
     return result
 
-def bivariate_loss(V_pred, V_trgt):
-    # mux, muy, sx, sy, corr
-    # assert V_pred.shape == V_trgt.shape
-    normx = V_trgt[..., 0] - V_pred[..., 0]
-    normy = V_trgt[..., 1] - V_pred[..., 1]
+def bivariate_loss(V_pred, V_trgt, mask=None):
+    """
+    Bivariate Gaussian NLL Loss (Vectorized).
+    V_pred: [Batch, Time, Nodes, 5] (mu_x, mu_y, log_sig_x, log_sig_y, logit_corr)
+    V_trgt: [Batch, Time, Nodes, 2] (gt_x, gt_y)
+    mask:   [Batch, Time, Nodes] (optional)
+    """
+    mu_x = V_pred[..., 0]
+    mu_y = V_pred[..., 1]
+    
+    # Exponentiate sigmas (model outputs log_sigma for stability)
+    sx = torch.exp(V_pred[..., 2]) 
+    sy = torch.exp(V_pred[..., 3])
+    
+    # Tanh correlation (model outputs logit to ensure [-1, 1])
+    corr = torch.tanh(V_pred[..., 4])
 
-    sx = torch.exp(V_pred[..., 2])  # sigma x
-    sy = torch.exp(V_pred[..., 3])  # sigma y
-    corr = torch.tanh(V_pred[..., 4])  # corr
+    x = V_trgt[..., 0]
+    y = V_trgt[..., 1]
+
+    # Normalized differences
+    normx = x - mu_x
+    normy = y - mu_y
 
     sxsy = sx * sy
-
-    z = (normx / sx) ** 2 + (normy / sy) ** 2 - 2 * ((corr * normx * normy) / sxsy)
-    negRho = 1 - corr ** 2
-
-    # Numerator
-    result = torch.exp(-z / (2 * negRho))
-    # Normalization factor
+    z = (normx/sx)**2 + (normy/sy)**2 - 2*((corr*normx*normy)/sxsy)
+    
+    negRho = 1 - corr**2
+    # Clamp for numerical stability
+    negRho = torch.clamp(negRho, min=1e-20)
+    
     denom = 2 * np.pi * (sxsy * torch.sqrt(negRho))
+    denom = torch.clamp(denom, min=1e-20)
 
-    # Final PDF calculation
+    result = torch.exp(-z/(2*negRho))
     result = result / denom
 
-    # Numerical stability
-    epsilon = 1e-20
-
-    result = -torch.log(torch.clamp(result, min=epsilon))
-    result = torch.mean(result)
-
-    # Ensure the loss is non NaN
-    if torch.isnan(result):
-        result = torch.tensor(0.0, device=V_pred.device, requires_grad=True)
+    loss = -torch.log(torch.clamp(result, min=1e-20))
     
-    return result
+    # Apply Mask if provided
+    if mask is not None:
+        # SAFER: Force padded values to 0.0 even if they are NaN/Inf
+        # mask is 1 for valid, 0 for pad. ~mask.bool() is True for pad.
+        loss = loss.masked_fill(~mask.bool(), 0.0)
+        
+        num_valid = torch.sum(mask)
+        if num_valid > 0:
+            return torch.sum(loss) / num_valid
+        else:
+             # Avoid NaN if batch is empty (unlikely)
+            return torch.tensor(0.0, device=loss.device)
+            
+    # Mean over all dimensions
+    return torch.mean(loss)

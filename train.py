@@ -38,7 +38,7 @@ parser.add_argument('--num_epochs', type=int, default=150, help='number of epoch
 parser.add_argument('--clip_grad', type=float, default=None, help='gradient clipping')
 parser.add_argument('--lr', type=float, default=0.01, help='learning rate')
 parser.add_argument('--lr_sh_rate', type=int, default=75, help='number of steps to drop the lr')
-parser.add_argument('--use_lrschd', action="store_true", default=False, help='Use lr rate scheduler')
+parser.add_argument('--use_lrschd', action="store_true", default=True, help='Use lr rate scheduler')
 parser.add_argument('--tag', default='tag', help='personal tag for the model')
 parser.add_argument('--delim', default='\t', help='Delimiter used in the dataset file')
 parser.add_argument('--shuffle', action="store_true", default=False, help='Whether to shuffle the sequences')
@@ -68,8 +68,13 @@ log_file.write('Epoch,Train_loss,Val_loss,Val_ADE,Val_FDE\n')
 with open(checkpoint_dir+'args.pkl', 'wb') as fp:
     pickle.dump(args, fp)
 
-def graph_loss(V_pred, V_target):
-    return bivariate_loss(V_pred, V_target)
+def graph_loss(V_pred, V_target, mask=None):
+    if mask is not None:
+         # Move mask to same device
+         mask = mask.to(V_pred.device)
+         return bivariate_loss(V_pred, V_target, mask)
+    else:
+        return bivariate_loss(V_pred, V_target)
 
 # -----------------------------------------------------------------------------
 # DATASET INITIALIZATION
@@ -153,7 +158,16 @@ model = CTAG(
 optimizer = optim.SGD(model.parameters(), lr=args.lr)
 
 if args.use_lrschd:
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_sh_rate, gamma=0.2)
+    # Changed to ReduceLROnPlateau for better convergence checking
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, 
+        mode='min', 
+        factor=0.5, 
+        patience=10, 
+        threshold=1e-4, 
+        min_lr=1e-6
+    )
+    # scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_sh_rate, gamma=0.2)
 else:
     scheduler = None
 
@@ -195,7 +209,15 @@ def train(epoch, model, optimizer, loader_train, metrics):
         
 
         # 4. Loss
-        l = graph_loss(V_pred, V_tr)
+        # Ensure mask is [Batch, Time, Nodes] to match V_pred structure
+        # loss_mask is [Batch, Nodes, Total_Time] -> Permute to [Batch, Total_Time, Nodes]
+        mask_perm = loss_mask.permute(0, 2, 1)
+        
+        # SLICE MASK: The loss is calculated only on prediction steps
+        # loss_mask covers obs + pred. We take the last pred_seq_len steps.
+        mask_perm = mask_perm[:, -args.pred_seq_len:, :]
+        
+        l = graph_loss(V_pred, V_tr, mask_perm)
         
         # [ADDED] Check for NaN/Inf in individual batch loss
         if torch.isnan(l) or torch.isinf(l) or (l.item() == 0 and epoch > 0):
@@ -263,8 +285,10 @@ def vald(epoch, model, loader_val, metrics, constant_metrics):
             V_pred, _ = model(V_obs_tmp, A_obs,batch_metadata)
             V_pred = V_pred.permute(0, 2, 3, 1)
             
-            
-            l = graph_loss(V_pred, V_tr)
+            mask_perm = loss_mask.permute(0, 2, 1)
+            # SLICE MASK (Validation too)
+            mask_perm = mask_perm[:, -args.pred_seq_len:, :]
+            l = graph_loss(V_pred, V_tr, mask_perm)
 
             if is_fst_loss:
                 loss = l
@@ -365,23 +389,37 @@ for epoch in range(args.num_epochs):
     # Scheduler
     if args.use_lrschd:
         if scheduler is not None:
+             # ReduceLROnPlateau requires a metric (validation loss usually)
+            current_val_loss = metrics['val_loss'][-1] if len(metrics['val_loss']) > 0 else float('inf')
+            
+            # Step with validation loss
+            scheduler.step(current_val_loss)
+            
+            # Old manual check (ReduceOnPlateau handles NaN internally usually, but safe to keep eye on logs)
             if len(metrics['train_loss']) > 0 and np.isnan(metrics['train_loss'][-1]):
-                print("NaN loss detected. Stepping scheduler.")
-                scheduler.step()
-            else:
-                scheduler.step()
+                print("NaN loss detected.")
 
     # Console Log
     print(f'Epoch: {epoch} | Train Loss: {metrics["train_loss"][-1]:.4f} | Val Loss: {metrics["val_loss"][-1]:.4f}')
 
     # Checkpoints
-    torch.save(model.state_dict(), os.path.join(checkpoint_dir, f'model_epoch{epoch}.pth'))
+    # Create checkpoint dict with metadata
+    checkpoint = {
+        'state_dict': model.state_dict(),
+        'scene_name': args.scene_name,
+        'args': args,
+        'epoch': epoch,
+        'metrics': metrics
+    }
+    
+    torch.save(checkpoint, os.path.join(checkpoint_dir, f'model_epoch{epoch}.pth'))
     
     curr_val_loss = metrics['val_loss'][-1] if len(metrics['val_loss']) > 0 else float('inf')
     if curr_val_loss < best_val_loss:
         best_val_loss = curr_val_loss
-        best_model_state = model.state_dict()
-        torch.save(best_model_state, os.path.join(checkpoint_dir, 'best_model.pth'))
+        best_model_state = model.state_dict() # Keep distinct logical copy if needed, or just use checkpoint
+        # Save best model with same metadata structure
+        torch.save(checkpoint, os.path.join(checkpoint_dir, 'best_model.pth'))
 
     with open(os.path.join(checkpoint_dir, 'metrics.pkl'), 'wb') as fp:
         pickle.dump(metrics, fp)
@@ -394,7 +432,12 @@ if not args.skip_val:
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
     elif os.path.exists(os.path.join(checkpoint_dir, 'best_model.pth')):
-        model.load_state_dict(torch.load(os.path.join(checkpoint_dir, 'best_model.pth')))
+        # Load checkpoint with weights_only=False because it contains args/Namespace
+        checkpoint = torch.load(os.path.join(checkpoint_dir, 'best_model.pth'), weights_only=False)
+        if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['state_dict'])
+        else:
+            model.load_state_dict(checkpoint)
     
     ade_calc, fde_calc = calculate_ade_fde(model, loader_val)
     print(f"Final Best Model - ADE: {ade_calc:.4f}, FDE: {fde_calc:.4f}")

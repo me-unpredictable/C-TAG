@@ -14,7 +14,7 @@ import torch.distributions.multivariate_normal as torchdist
 
 # Import your modules
 from model import CTAG
-from utils import TrajectoryDataset, seq_to_graph
+from utils_by_scene import TrajectoryDataset, seq_collate
 from metrics import ade, fde
 
 def get_model_path(checkpoint_root='./checkpoint/'):
@@ -180,8 +180,16 @@ def evaluate(model, loader, args, num_samples=20):
             min_ade, _ = torch.min(batch_ade, dim=0) # [Batch, NumPed]
             min_fde, _ = torch.min(batch_fde, dim=0) # [Batch, NumPed]
             
-            ade_list.extend(min_ade.cpu().numpy().flatten().tolist())
-            fde_list.extend(min_fde.cpu().numpy().flatten().tolist())
+            # --- FIX: Filter out dummy agents using loss_mask ---
+            # loss_mask is [Batch, NumPed, SeqLen]
+            # An agent is valid if it has non-zero entries in the mask (i.e. not padding)
+            agent_mask = loss_mask.sum(dim=-1) > 0 # [Batch, NumPed]
+            
+            valid_ade = min_ade[agent_mask]
+            valid_fde = min_fde[agent_mask]
+            
+            ade_list.extend(valid_ade.cpu().numpy().flatten().tolist())
+            fde_list.extend(valid_fde.cpu().numpy().flatten().tolist())
 
     print(f"\nFinal Results (Best-of-{num_samples}):")
     print(f"ADE: {np.mean(ade_list):.4f}")
@@ -191,18 +199,41 @@ def main():
     # 1. Get Model
     model_path, args_path = get_model_path()
     
-    # 2. Load Args
+    # 2. Load Args (Base config)
     with open(args_path, 'rb') as f:
         args = pickle.load(f)
         
     print(f"\nConfiguration Loaded from: {args_path}")
     
+    # 2.5 Peek at checkpoint for Metadata (Scene Name)
+    print(f"Inspecting checkpoint metadata from {model_path}...")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Set weights_only=False to allow loading argparse.Namespace embedded in checkpoint
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+    
+    scene_name = getattr(args, 'scene_name', 'bookstore') # Default
+    state_dict = checkpoint
+    
+    if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+        print("Detected new checkpoint format.")
+        state_dict = checkpoint['state_dict']
+        if 'scene_name' in checkpoint:
+            scene_name = checkpoint['scene_name']
+            print(f"Found embedded scene name: {scene_name}")
+    
     # 3. Setup Data
-    test_data_dir = './processed/test'
+    print(f"Targeting Scene: {scene_name}")
+    
+    test_data_dir = os.path.join('./processed/test', scene_name)
+    
     if not os.path.exists(test_data_dir):
         print(f"Error: {test_data_dir} does not exist.")
-        # fallback to args.dataset path if 'processed' doesn't exist?
-        # Assuming user has data here as requested.
+        # fallback to just ./processed/test if specific scene not found? 
+        # But user wants strict separation.
+        print("Checking parent test dir...")
+        if os.path.exists('./processed/test'):
+             print("Warning: Specific scene dir not found, using generic ./processed/test")
+             test_data_dir = './processed/test'
         
     print(f"Loading Test Data from {test_data_dir}...")
     
@@ -221,11 +252,11 @@ def main():
         batch_size=1, 
         shuffle=False,
         num_workers=4,
-        collate_fn=TrajectoryDataset.collate_fn
+        collate_fn=seq_collate
     )
     
     # 4. Initialize Model
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # device already set
     
     model = CTAG(
         n_gcnn=args.n_gcnn,
@@ -238,9 +269,9 @@ def main():
     ).to(device)
     
     # 5. Load Weights
-    print(f"Loading weights from {model_path}...")
+    print(f"Applying weights...")
     try:
-        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.load_state_dict(state_dict)
     except RuntimeError as e:
         print(f"Error loading state dict: {e}")
         # Try cleaning buffer/metadata keys if mismatch?
