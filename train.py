@@ -36,7 +36,7 @@ parser.add_argument('--scene_name', default='bookstore', help='Scene name to tra
 parser.add_argument('--batch_size', type=int, default=512, help='minibatch size (Virtual Batch Size for Gradient Accumulation)')
 parser.add_argument('--num_epochs', type=int, default=150, help='number of epochs')
 parser.add_argument('--clip_grad', type=float, default=None, help='gradient clipping')
-parser.add_argument('--lr', type=float, default=0.01, help='learning rate')
+parser.add_argument('--lr', type=float, default=0.1, help='learning rate')
 parser.add_argument('--lr_sh_rate', type=int, default=75, help='number of steps to drop the lr')
 parser.add_argument('--use_lrschd', action="store_true", default=True, help='Use lr rate scheduler')
 parser.add_argument('--tag', default='tag', help='personal tag for the model')
@@ -162,9 +162,10 @@ if args.use_lrschd:
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, 
         mode='min', 
-        factor=0.5, 
+        factor=0.1, 
         patience=10, 
-        threshold=1e-4, 
+        threshold=1e-2, 
+        threshold_mode='abs',
         min_lr=1e-6
     )
     # scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_sh_rate, gamma=0.2)
@@ -394,7 +395,7 @@ for epoch in range(args.num_epochs):
             
             # Step with validation loss
             scheduler.step(current_val_loss)
-            
+            print(f"Learning Rate after Epoch {epoch}: {optimizer.param_groups[0]['lr']}")
             # Old manual check (ReduceOnPlateau handles NaN internally usually, but safe to keep eye on logs)
             if len(metrics['train_loss']) > 0 and np.isnan(metrics['train_loss'][-1]):
                 print("NaN loss detected.")
