@@ -282,67 +282,6 @@ class VSIE(nn.Module):
         out=out.reshape(x_original)
         return out
 
-class TemporalTransformer(nn.Module):
-    def __init__(self, in_channels, seq_len, pred_seq_len, d_model=128, nhead=4, num_layers=4):
-        super(TemporalTransformer, self).__init__()
-        self.d_model = d_model
-        self.seq_len = seq_len
-        self.pred_seq_len = pred_seq_len
-
-        # Feature Projection
-        self.input_proj = nn.Linear(in_channels, d_model)
-        
-        # Positional Encoding
-        self.pos_encoder = nn.Parameter(torch.zeros(1, seq_len, d_model))
-        # Initialize pos encoding
-        position = torch.arange(0, seq_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        self.pos_encoder.data[0, :, 0::2] = torch.sin(position * div_term)
-        self.pos_encoder.data[0, :, 1::2] = torch.cos(position * div_term)
-
-        # Transformer Encoder
-        encoder_layers = nn.TransformerEncoderLayer(d_model, nhead, dim_feedforward=512, dropout=0.1, batch_first=True)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers)
-
-        # Output Projection (Flatten T -> Linear -> PredT)
-        self.flatten_dim = seq_len * d_model
-        # Use a MLP to map from flattened input sequence to flattened output sequence
-        self.output_proj = nn.Sequential(
-            nn.Linear(self.flatten_dim, d_model * 2),
-            nn.ReLU(),
-            nn.Linear(d_model * 2, pred_seq_len * in_channels)
-        )
-
-    def forward(self, x):
-        # x input shape: (N, C, T, V) from GCN
-        N, C, T, V = x.shape
-        
-        # Permute to treat each node as a sequence: (N*V, T, C)
-        x = x.permute(0, 3, 2, 1).contiguous()
-        x = x.view(N * V, T, C)
-        
-        # Project to d_model
-        x = self.input_proj(x) # (HV, T, d_model)
-        
-        # Add Positional Encoding
-        x = x + self.pos_encoder
-        
-        # Transformer Pass
-        x = self.transformer_encoder(x) # (HV, T, d_model)
-        
-        # Flatten time dim
-        x = x.reshape(N * V, -1) # (HV, T*d_model)
-        
-        # Project to Output
-        out = self.output_proj(x) # (HV, PredT*C)
-        
-        # Reshape to (N, C, PredT, V) to match expected output
-        out = out.view(N, V, self.pred_seq_len, C)
-        out = out.permute(0, 3, 2, 1).contiguous() # (N, C, PredT, V)
-        
-        return out
-
-
 class CTAG(nn.Module):
     def __init__(self,threshold,n_gcnn =1,n_tcnn=1,input_feat=2,output_feat=5,
                  seq_len=8,pred_seq_len=12,kernel_size=3):
@@ -356,25 +295,23 @@ class CTAG(nn.Module):
         for j in range(1,self.n_gcnn):
             self.st_gcns.append(st_gcn(output_feat,output_feat,(kernel_size,seq_len)))
 
-        # REPLACEMENT: Transformer for Temporal Pattern Extraction
-        # We reuse n_tcnn to scale the transformer (e.g. layers)
-        # Using d_model=128 to ensure capacity for SDD patterns
-        self.temporal_transformer = TemporalTransformer(
-            in_channels=output_feat,
-            seq_len=seq_len,
-            pred_seq_len=pred_seq_len,
-            d_model=128,
-            nhead=4,
-            num_layers=max(2, n_tcnn) # Ensure at least 2 layers
-        )
-        
-        # Legacy: Keeping prelus definition if needed to avoid breaking state_dict loading (though logic changes)
-        # But for new model structure, we don't use them. 
-        # Since user asked to modify model.py, we can change architecture.
-        # self.tpcnns = nn.ModuleList() ... (Removed)
+        if self.n_tcnn>1:
+            self.tpcnns = nn.ModuleList()
+            self.tpcnns.append(nn.Conv2d(seq_len,pred_seq_len,3,padding=1))
+            for j in range(1,self.n_tcnn):
+                self.tpcnns.append(nn.Conv2d(pred_seq_len,pred_seq_len,3,padding=1))
+            self.tpcnn_ouput = nn.Conv2d(pred_seq_len,pred_seq_len,3,padding=1)
+        else:
+            if self.n_tcnn < 1:
+                self.n_tcnn = 1
+            self.tpcnns = nn.ModuleList()
+            self.tpcnns.append(nn.Conv2d(seq_len,pred_seq_len,3,padding=1))
+            self.tpcnn_ouput = nn.Identity()
             
-        self.prelus = nn.ModuleList() # Placeholder or remove if not used in forward
-        
+        self.prelus = nn.ModuleList()
+        for j in range(self.n_tcnn):
+            self.prelus.append(nn.PReLU())
+
     def forward(self,v,a,metadata=None):
         assert metadata is not None, "Metadata is required for CTAG model"
 
@@ -407,12 +344,14 @@ class CTAG(nn.Module):
         for k in range(self.n_gcnn):
             v, a = self.st_gcns[k](v, a)
 
-        # Transfomer Temporal Extraction
-        # v output from GCN is (N, C, T, V)
-        # Passed directly to TemporalTransformer
-        v = self.temporal_transformer(v)
+        v = v.view(v.shape[0], v.shape[2], v.shape[1], v.shape[3])
         
-        # Output is (N, C, PredT, V), matching CTAG expectation
-        
-        # Ensure we return a matching 'a' (adjacency) effectively unchanged or just updated graph state
+        if self.n_tcnn >= 1:
+            v = self.prelus[0](self.tpcnns[0](v))
+            for k in range(1, self.n_tcnn - 1):
+                v = self.prelus[k](self.tpcnns[k](v)) + v
+
+        v = self.tpcnn_ouput(v)
+        v = v.view(v.shape[0], v.shape[2], v.shape[1], v.shape[3]) 
+
         return v, a
