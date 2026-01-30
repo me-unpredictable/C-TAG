@@ -141,8 +141,12 @@ def bivariate_loss(V_pred, V_trgt, mask=None):
     mu_y = V_pred[..., 1]
     
     # Exponentiate sigmas (model outputs log_sigma for stability)
-    sx = torch.exp(V_pred[..., 2]) 
-    sy = torch.exp(V_pred[..., 3])
+    # Clamp log_sigma to prevent Inf/NaN in exp() and division by zero
+    log_sx = torch.clamp(V_pred[..., 2], min=-20, max=6)
+    log_sy = torch.clamp(V_pred[..., 3], min=-20, max=6)
+    
+    sx = torch.exp(log_sx) 
+    sy = torch.exp(log_sy)
     
     # Tanh correlation (model outputs logit to ensure [-1, 1])
     corr = torch.tanh(V_pred[..., 4])
@@ -183,4 +187,32 @@ def bivariate_loss(V_pred, V_trgt, mask=None):
             return torch.tensor(0.0, device=loss.device)
             
     # Mean over all dimensions
+    return torch.mean(loss)
+
+def masked_mse_loss(V_pred, V_trgt, mask=None):
+    """
+    Masked MSE Loss for warm-up.
+    V_pred: [Batch, Time, Nodes, 5] (mu_x, mu_y, ...) - we only use mu_x, mu_y
+    V_trgt: [Batch, Time, Nodes, 2] (gt_x, gt_y)
+    mask:   [Batch, Time, Nodes] (optional)
+    """
+    mu_x = V_pred[..., 0]
+    mu_y = V_pred[..., 1]
+    
+    x = V_trgt[..., 0]
+    y = V_trgt[..., 1]
+    
+    # Squared Error
+    loss = (x - mu_x)**2 + (y - mu_y)**2
+    
+    # Apply Mask if provided
+    if mask is not None:
+        loss = loss.masked_fill(~mask.bool(), 0.0)
+        
+        num_valid = torch.sum(mask)
+        if num_valid > 0:
+            return torch.sum(loss) / num_valid
+        else:
+            return torch.tensor(0.0, device=loss.device)
+            
     return torch.mean(loss)

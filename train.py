@@ -16,6 +16,30 @@ from model import CTAG
 from utils_by_scene import TrajectoryDataset
 from metrics import *#ade_loss, fde_loss, bivariate_loss
 
+# [FIX] Define masked_mse_loss locally if import fails or for clarity
+def masked_mse_loss(V_pred, V_trgt, mask=None):
+    """
+    Masked MSE Loss for warm-up.
+    V_pred: [Batch, Time, Nodes, 5] (mu_x, mu_y, ...)
+    V_trgt: [Batch, Time, Nodes, 2] (gt_x, gt_y)
+    """
+    mu_x = V_pred[..., 0]
+    mu_y = V_pred[..., 1]
+    
+    x = V_trgt[..., 0]
+    y = V_trgt[..., 1]
+    
+    loss = (x - mu_x)**2 + (y - mu_y)**2
+    
+    if mask is not None:
+        loss = loss.masked_fill(~mask.bool(), 0.0)
+        num_valid = torch.sum(mask)
+        if num_valid > 0:
+            return torch.sum(loss) / num_valid
+        return torch.tensor(0.0, device=loss.device)
+    return torch.mean(loss)
+
+
 parser = argparse.ArgumentParser()
 
 # Model specific parameters
@@ -68,13 +92,20 @@ log_file.write('Epoch,Train_loss,Val_loss,Val_ADE,Val_FDE\n')
 with open(checkpoint_dir+'args.pkl', 'wb') as fp:
     pickle.dump(args, fp)
 
-def graph_loss(V_pred, V_target, mask=None):
+def graph_loss(V_pred, V_target, mask=None, use_mse=False):
     if mask is not None:
          # Move mask to same device
          mask = mask.to(V_pred.device)
-         return bivariate_loss(V_pred, V_target, mask)
+         
+         if use_mse:
+            return masked_mse_loss(V_pred, V_target, mask)
+         else:
+            return bivariate_loss(V_pred, V_target, mask)
     else:
-        return bivariate_loss(V_pred, V_target)
+        if use_mse:
+            return masked_mse_loss(V_pred, V_target)
+        else:
+            return bivariate_loss(V_pred, V_target)
 
 # -----------------------------------------------------------------------------
 # DATASET INITIALIZATION
@@ -154,9 +185,9 @@ model = CTAG(
     pred_seq_len=args.pred_seq_len,
     threshold=args.thres
 ).to(device)
-
-optimizer = optim.SGD(model.parameters(), lr=args.lr)
-
+# Optimizer and Scheduler
+# optimizer = optim.SGD(model.parameters(), lr=args.lr)
+optimizer = optim.Adam(model.parameters(), lr=0.001) # Lower LR for Adam
 if args.use_lrschd:
     # Changed to ReduceLROnPlateau for better convergence checking
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -166,7 +197,7 @@ if args.use_lrschd:
         patience=10, 
         threshold=1e-2, 
         threshold_mode='abs',
-        min_lr=1e-6
+        min_lr=1e-4
     )
     # scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_sh_rate, gamma=0.2)
 else:
@@ -184,7 +215,9 @@ def train(epoch, model, optimizer, loader_train, metrics):
     loader_len = len(loader_train)
     
     # [ADDED] Progress Bar
-    pbar = tqdm(loader_train, desc=f"Epoch {epoch} [Train]", unit="seq")
+    use_mse = (epoch < 30)
+    desc_str = f"Epoch {epoch} [Train MSE]" if use_mse else f"Epoch {epoch} [Train NLL]"
+    pbar = tqdm(loader_train, desc=desc_str, unit="seq")
 
     for cnt, batch in enumerate(pbar): 
         batch_count += 1
@@ -201,7 +234,7 @@ def train(epoch, model, optimizer, loader_train, metrics):
 
 
         # 3. Forward
-        optimizer.zero_grad()
+        # optimizer.zero_grad() # MOVED to step 5
         V_obs_tmp = V_obs.permute(0, 3, 1, 2)
         
         V_pred, _ = model(V_obs_tmp, A_obs,batch_metadata) 
@@ -218,7 +251,15 @@ def train(epoch, model, optimizer, loader_train, metrics):
         # loss_mask covers obs + pred. We take the last pred_seq_len steps.
         mask_perm = mask_perm[:, -args.pred_seq_len:, :]
         
-        l = graph_loss(V_pred, V_tr, mask_perm)
+        # [FIX] V_tr from dataset is (B, T, V, C). 
+        # Loss expects (B, T, V, C).
+        # V_tr_perm = V_tr.permute(0, 3, 2, 1) # OLD BUG
+        
+        # It seems V_tr is ALREADY (B, T, V, C) based on utils_by_scene.py pad_V returning (T, N, D)
+        # So no permutation needed, or identity.
+        V_tr_perm = V_tr # (B, T, V, C)
+        
+        l = graph_loss(V_pred, V_tr_perm, mask_perm, use_mse=use_mse)
         
         # [ADDED] Check for NaN/Inf in individual batch loss
         if torch.isnan(l) or torch.isinf(l) or (l.item() == 0 and epoch > 0):
@@ -238,12 +279,13 @@ def train(epoch, model, optimizer, loader_train, metrics):
         turn_point = int(loader_len / args.batch_size) * args.batch_size + loader_len % args.batch_size - 1
         
         if batch_count % args.batch_size == 0 or cnt == turn_point:
+            optimizer.zero_grad() # Correct placement for Gradient Accumulation
             loss = loss / args.batch_size
             loss.backward()
             
-            # [MODIFIED] Enforce gradient clipping even if not in args (optional but recommended)
-            clip_val = args.clip_grad if args.clip_grad is not None else 1.0 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), clip_val)
+            # [MODIFIED] Only clip gradients if explicitly requested
+            if args.clip_grad is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
             
             optimizer.step()
             
@@ -267,7 +309,9 @@ def vald(epoch, model, loader_val, metrics, constant_metrics):
     loader_len = len(loader_val)
     
     # [ADDED] Progress Bar
-    pbar = tqdm(loader_val, desc=f"Epoch {epoch} [Val]", unit="seq")
+    use_mse = (epoch < 30)
+    desc_str = f"Epoch {epoch} [Val MSE]" if use_mse else f"Epoch {epoch} [Val NLL]"
+    pbar = tqdm(loader_val, desc=desc_str, unit="seq")
     
     with torch.no_grad():
         for cnt, batch in enumerate(pbar): 
@@ -289,7 +333,11 @@ def vald(epoch, model, loader_val, metrics, constant_metrics):
             mask_perm = loss_mask.permute(0, 2, 1)
             # SLICE MASK (Validation too)
             mask_perm = mask_perm[:, -args.pred_seq_len:, :]
-            l = graph_loss(V_pred, V_tr, mask_perm)
+            
+            # [FIX] V_tr from dataset is (B, T, V, C). 
+            V_tr_perm = V_tr
+            
+            l = graph_loss(V_pred, V_tr_perm, mask_perm, use_mse=use_mse)
 
             if is_fst_loss:
                 loss = l
@@ -340,7 +388,10 @@ def calculate_ade_fde(model, loader_val):
             count_list = []
             
             V_pred_np = V_pred.cpu().numpy()
-            V_tr_np = V_tr.cpu().numpy()
+            # [FIX] V_tr also needs permutation here to match V_pred structure for ADE/FDE logic
+            V_tr_perm = V_tr
+            V_tr_np = V_tr_perm.cpu().numpy()
+            
             loss_mask_np = loss_mask.cpu().numpy() # (B, N, T)
             
             for i in range(batch_size):
@@ -391,10 +442,17 @@ for epoch in range(args.num_epochs):
     if args.use_lrschd:
         if scheduler is not None:
              # ReduceLROnPlateau requires a metric (validation loss usually)
-            current_val_loss = metrics['val_loss'][-1] if len(metrics['val_loss']) > 0 else float('inf')
-            
+            #current_val_loss = metrics['val_loss'][-1] if len(metrics['val_loss']) > 0 else float('inf')
+            # base on train loss lr scheduler must work
+            current_train_loss = metrics['train_loss'][-1] if len(metrics['train_loss']) > 0 else float('inf')
+    
+
             # Step with validation loss
-            scheduler.step(current_val_loss)
+            # scheduler.step(current_val_loss)
+
+            # Step with training loss
+            scheduler.step(current_train_loss)
+
             print(f"Learning Rate after Epoch {epoch}: {optimizer.param_groups[0]['lr']}")
             # Old manual check (ReduceOnPlateau handles NaN internally usually, but safe to keep eye on logs)
             if len(metrics['train_loss']) > 0 and np.isnan(metrics['train_loss'][-1]):

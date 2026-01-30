@@ -126,7 +126,7 @@ class st_gcn(nn.Module):
         
 
         self.tcn = nn.Sequential(
-            nn.BatchNorm2d(out_channels),
+            nn.GroupNorm(1, out_channels), # Replaced BatchNorm2d with GroupNorm(1, C) -> LayerNorm behavior
             nn.PReLU(),
             nn.Conv2d(
                 out_channels,
@@ -135,7 +135,7 @@ class st_gcn(nn.Module):
                 (stride, 1),
                 padding,
             ),
-            nn.BatchNorm2d(out_channels),
+            nn.GroupNorm(1, out_channels), # Replaced BatchNorm2d
             nn.Dropout(dropout, inplace=True),
         )
 
@@ -152,7 +152,7 @@ class st_gcn(nn.Module):
                     out_channels,
                     kernel_size=1,
                     stride=(stride, 1)),
-                nn.BatchNorm2d(out_channels),
+                nn.GroupNorm(1, out_channels), # Replaced BatchNorm2d
             )
 
         self.prelu = nn.PReLU()

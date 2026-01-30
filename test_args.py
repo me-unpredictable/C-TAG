@@ -210,8 +210,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # Set weights_only=False to allow loading argparse.Namespace embedded in checkpoint
     checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-    
-    scene_name = getattr(args, 'scene_name', 'bookstore') # Default
+    scene_name = None
     state_dict = checkpoint
     
     if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
