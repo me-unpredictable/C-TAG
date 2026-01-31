@@ -227,38 +227,71 @@ class VSIE(nn.Module):
         return x * mask
 
     def positional_encoding(self, x):
-        # NOTE: Be careful with dimensions here. x is [Batch, 2, Seq, Nodes]
-        x_squeezed = x.squeeze(0) # Squeeze batch if 1
+        # Correctly apply positional encoding to the time dimension
+        # Input x: [Batch, Time, Nodes, Features]
         
-        # Safety check if squeeze removed wrong dim or input has unexpected shape
-        if x_squeezed.dim() != 3: 
-             # Fallback if batch size > 1 (Squeeze might not be needed or removes dim 0)
-             # Assuming standard layout [Batch, 2, Seq, Nodes] -> need [?, Seq, Feat]?
-             # Legacy logic was assuming specific unpacking. We keep it as is but warn.
-             pass
-        
-        batch_size, seq_len, in_feat = x_squeezed.size()
+        if x.dim() == 4:
+            batch_size, seq_len, num_nodes, in_feat = x.size()
+        elif x.dim() == 3:
+            # Fallback for [Time, Nodes, Features]
+            seq_len, num_nodes, in_feat = x.size()
+        else:
+            return x
+
         pos_enc = torch.zeros((seq_len, in_feat), device=x.device)
-        for pos in range(seq_len):
-            for i in range(0, in_feat, 2):
-                pos_enc[pos, i] = math.sin(pos / (10000 ** ((2 * i) / in_feat)))
-                if i + 1 < in_feat:
-                    pos_enc[pos, i + 1] = math.cos(pos / (10000 ** ((2 * (i + 1)) / in_feat)))
-        pos_enc = pos_enc.unsqueeze(0).repeat(batch_size, 1, 1)
-        return x_squeezed + pos_enc
+        div_term = torch.exp(torch.arange(0, in_feat, 2, dtype=torch.float, device=x.device) *
+                             -(math.log(10000.0) / in_feat))
+
+        position = torch.arange(0, seq_len, dtype=torch.float, device=x.device).unsqueeze(1)
+        
+        pos_enc[:, 0::2] = torch.sin(position * div_term)
+        if in_feat > 1:
+            pos_enc[:, 1::2] = torch.cos(position * div_term)
+
+        # Reshape for broadcasting [1, T, 1, C]
+        if x.dim() == 4:
+            pos_enc = pos_enc.unsqueeze(0).unsqueeze(2)
+        else:
+             pos_enc = pos_enc.unsqueeze(1)
+             
+        return x + pos_enc
 
     def forward(self,x,metadata):
+        # Input x is [Batch, Channel, Time, Nodes] = [B, 2, T, V]
         x_input_coords = x.clone() 
         x_original = x.shape 
 
-        x= self.positional_encoding(x)
+        # Fix: Permute to [Batch, Time, Nodes, Channel] for PE and LSTM
+        # Requires x to be [B, C, T, V]
+        if x.dim() == 4 and x.size(1) == 2:
+            x = x.permute(0, 2, 3, 1) # [B, T, V, C]
+        
+        # Apply PE (expects [B, T, V, C])
+        x = self.positional_encoding(x)
 
-        x=x.reshape(-1,2)
-        X,_=self.encoder(x) 
+        # Flatten for LSTM [B*T*V, C] -> LSTM -> [B*T*V, C*2]
+        # NOTE: LSTM expects 3D input. If previous code worked with 2D, it might be auto-unsqeezing or
+        # treating as (L, N, H) or (N, L, H).
+        # To strictly maintain logic but fix OOM, we must respect Batch boundaries.
+        
+        b, t, n, c_in = x.size()
+        
+        # Reshape to [B * T * V, 1, C] for LSTM if we want to treat each node-time as independent sequence of len 1?
+        # Or [B * V, T, C] if we want temporal LSTM?
+        # Given "x_reshaped = x.contiguous().view(-1, 2)", it merges everything.
+        # Assuming original intent was just embedding, but using LSTM? 
+        # We will keep the Flatten-Run-Flatten logic but reshape for Attention.
+        
+        x_reshaped = x.contiguous().view(-1, c_in) # [B*T*V, C]
+        
+        # Assuming encoder handles 2D input by treating it as (Batch=N, Seq=1, Feat) or similar.
+        # We unsqueeze to be safe: [N, 1, C]
+        X_lstm, _ = self.encoder(x_reshaped.unsqueeze(1)) 
+        X = X_lstm.squeeze(1) # [B*T*V, C*2]
 
         # --- C-TAG FUSION LOGIC ---
         if metadata is not None:
-            batch_size = x_original[0]
+            batch_size = x_original[0] # Original B from [B, C, T, V]
             
             if metadata.size(0) != batch_size:
                 visual_map = metadata.expand(batch_size, -1, -1, -1)
@@ -266,20 +299,52 @@ class VSIE(nn.Module):
                 visual_map = metadata
                 
             compressed_map = self.compressor(visual_map)
+            # extract_local_context handles per-structure coords, but requires input [B, C, T, V]
+            # x_input_coords is still [B, C, T, V]
             local_context = self.extract_local_context(compressed_map, x_input_coords)
-            local_context_flat = local_context.view(X.shape[0], 32)
+            local_context_flat = local_context.reshape(X.shape[0], 32)
             
             fused_features = torch.cat([X, local_context_flat], dim=-1)
             X = self.visual_fusion(fused_features)
             
-        Q=self.fc(X) 
-        K=self.fc2(x) 
-        v=self.fc3(x) 
+        Q = self.fc(X)     # [B*T*V, 4C]
+        K = self.fc2(x_reshaped) # [B*T*V, 4C]
+        v = self.fc3(x_reshaped) # [B*T*V, 4C]
         
-        out=Func.sigmoid(torch.matmul(Q,K.T))@v
+        # --- BATCHED ATTENTION START ---
+        # Reshape to [B, T*V, Features] to compute attention per sample
+        q_dim = Q.shape[-1]
+        
+        Q_batched = Q.view(b, t * n, -1) # [B, T*V, 4C]
+        K_batched = K.view(b, t * n, -1) # [B, T*V, 4C]
+        v_batched = v.view(b, t * n, -1) # [B, T*V, 4C]
+        
+        # Batched Matmul: (B, TV, D) x (B, D, TV) -> (B, TV, TV)
+        attn_scores = torch.bmm(Q_batched, K_batched.transpose(1, 2))
+        attn_probs = Func.sigmoid(attn_scores)
+        
+        # Apply to V: (B, TV, TV) x (B, TV, D) -> (B, TV, D)
+        out_batched = torch.bmm(attn_probs, v_batched)
+        
+        # Flatten back to [B*T*V, 4C]
+        out = out_batched.view(-1, q_dim)
+        # --- BATCHED ATTENTION END ---
+        
+        # Threshold logic requires careful dimension handling
+        # x_original[3] is Nodes if input was [B, 2, T, V]
+        # But we are in flat land.
         out=self.threshold_relu(out,self.th,x_original[3]) 
+        
         out=self.fc_out(out)
-        out=out.reshape(x_original)
+        
+        # Reshape back to [Batch, Time, Nodes, Channels]
+        # x input to PE was [B, T, V, C].
+        b, t, n, c = x.size()
+        out = out.view(b, t, n, -1) # [B, T, V, C_out]
+        
+        # Permute back to [Batch, Channel, Time, Nodes]
+        out = out.permute(0, 3, 1, 2)
+        
         return out
 
 class TemporalTransformer(nn.Module):
@@ -378,28 +443,36 @@ class CTAG(nn.Module):
     def forward(self,v,a,metadata=None):
         assert metadata is not None, "Metadata is required for CTAG model"
 
-        pt_filename = None
-        # if isinstance(metadata, (tuple, list)):
-        #     try:
-        #         # Handle batch of tuples: (('scene',), ('video',))
-        #         scene_id = metadata[0][0] if isinstance(metadata[0], (tuple, list)) else metadata[0]
-        #         video_id = metadata[1][0] if isinstance(metadata[1], (tuple, list)) else metadata[1]
-        #         pt_filename = f"{scene_id}_{video_id}_map.pt"
-        #     except Exception:
-        pt_filename = str(metadata)
-        # pt_filename = pt_filename.split('.')[0] + '_map.pt'
-        # elif isinstance(metadata, str):
-        #     pt_filename = metadata
-
-        if pt_filename is None:
-             raise ValueError(f"Could not parse metadata: {metadata}")
-
-        map_path = os.path.join('./processed/maps', pt_filename)
-        if not os.path.exists(map_path):
-            raise FileNotFoundError(f"Visual Context Map not found at: {map_path}")
+        # Handle Batch Processing of Metadata
+        maps_list = []
+        
+        # If metadata is a list/tuple (from batching), iterate
+        if isinstance(metadata, (list, tuple)):
+            meta_batch = metadata
+        else:
+            meta_batch = [metadata] # Handle single item (Batch=1)
             
-        # map_tensor has no grad (Input data)
-        map_tensor = torch.load(map_path, map_location=v.device)
+        for meta_item in meta_batch:
+            # Logic to parse filename from metadata item
+            # Revert to simple string conversion if it's just the filename string
+            pt_filename = str(meta_item)
+            
+            map_path = os.path.join('./processed/maps', pt_filename)
+            
+            if not os.path.exists(map_path):
+                 # Fallback logic if needed, or raise cleaner error
+                 raise FileNotFoundError(f"Visual Context Map not found: {map_path}")
+            
+            # Load map [C, H, W]
+            single_map = torch.load(map_path, map_location=v.device)
+            if single_map.dim() == 4:
+                single_map = single_map.squeeze(0)
+            maps_list.append(single_map)
+            
+        # Stack into [Batch, C, H, W]
+        # v is [Batch, 2, Time, Nodes] (input from train.py)
+        # We need map_tensor to be [Batch, C, H, W] to match v's Batch dim
+        map_tensor = torch.stack(maps_list, dim=0)
 
         # Pass to VSIE (Compressor inside VSIE will attach grad)
         v = self.vsie(v, map_tensor) 

@@ -12,6 +12,9 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm  # [ADDED] For progress bars
 
+# FORCE GPU 1
+# os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+
 from model import CTAG
 from utils_by_scene import TrajectoryDataset
 from metrics import *#ade_loss, fde_loss, bivariate_loss
@@ -39,7 +42,22 @@ def masked_mse_loss(V_pred, V_trgt, mask=None):
         return torch.tensor(0.0, device=loss.device)
     return torch.mean(loss)
 
+def graph_loss(V_pred, V_target, mask=None, use_mse=False):
+    if mask is not None:
+         # Move mask to same device
+         mask = mask.to(V_pred.device)
+         
+         if use_mse:
+            return masked_mse_loss(V_pred, V_target, mask)
+         else:
+            return bivariate_loss(V_pred, V_target, mask)
+    else:
+        if use_mse:
+            return masked_mse_loss(V_pred, V_target)
+        else:
+            return bivariate_loss(V_pred, V_target)
 
+# Global Args Parsing
 parser = argparse.ArgumentParser()
 
 # Model specific parameters
@@ -74,134 +92,6 @@ parser.add_argument('--n_splits', type=int, default=1, help='(Deprecated) Number
 
 args = parser.parse_args()
 
-print('*'*30)
-print("Training initiating....")
-print(args)
-
-# Create log directories
-os.makedirs(args.log_dir, exist_ok=True)
-checkpoint_dir = './checkpoint/'+args.tag+'/'
-os.makedirs(checkpoint_dir, exist_ok=True)
-
-# Log file setup
-log_file = open(os.path.join(args.log_dir, time.ctime()+'_log.txt'), 'w')
-log_file.write(str(args)+'\n')
-log_file.write('Epoch,Train_loss,Val_loss,Val_ADE,Val_FDE\n')
-
-# Save args
-with open(checkpoint_dir+'args.pkl', 'wb') as fp:
-    pickle.dump(args, fp)
-
-def graph_loss(V_pred, V_target, mask=None, use_mse=False):
-    if mask is not None:
-         # Move mask to same device
-         mask = mask.to(V_pred.device)
-         
-         if use_mse:
-            return masked_mse_loss(V_pred, V_target, mask)
-         else:
-            return bivariate_loss(V_pred, V_target, mask)
-    else:
-        if use_mse:
-            return masked_mse_loss(V_pred, V_target)
-        else:
-            return bivariate_loss(V_pred, V_target)
-
-# -----------------------------------------------------------------------------
-# DATASET INITIALIZATION
-# -----------------------------------------------------------------------------
-processed_train_dir = os.path.join('./processed/train', args.scene_name)
-processed_val_dir = os.path.join('./processed/val', args.scene_name)
-
-# Check if processed data exists for this scene
-files_exist = os.path.exists(processed_train_dir) and len(glob.glob(os.path.join(processed_train_dir, "*.pkl"))) > 0
-
-if args.reload_data or not files_exist:
-    print(f"Processed data for {args.scene_name} missing or reload requested. Generating splits from RAW data...")
-    # This generates ALL scenes into ./processed
-    _ = TrajectoryDataset(
-        data_dir=args.dataset_path,
-        obs_len=args.obs_seq_len,
-        pred_len=args.pred_seq_len,
-        skip=1,
-        norm_lap_matr=True,
-        delim=args.delim,
-        dataset_name=args.dataset
-    )
-    print("Data generation complete.")
-
-print(f"Initializing Datasets for Scene: {args.scene_name}...")
-
-dset_train = TrajectoryDataset(
-    data_dir=processed_train_dir,
-    obs_len=args.obs_seq_len,
-    pred_len=args.pred_seq_len,
-    skip=1,
-    norm_lap_matr=True,
-    delim=args.delim,
-    dataset_name=args.dataset
-)
-
-loader_train = DataLoader(
-    dset_train,
-    batch_size=1, # Must be 1 for variable sequence length
-    shuffle=args.shuffle,
-    num_workers=0,
-    collate_fn=TrajectoryDataset.collate_fn 
-)
-
-loader_val = None
-if not args.skip_val:
-    dset_val = TrajectoryDataset(
-        data_dir=processed_val_dir,
-        obs_len=args.obs_seq_len,
-        pred_len=args.pred_seq_len,
-        skip=1,
-        norm_lap_matr=True,
-        delim=args.delim,
-        dataset_name=args.dataset
-    )
-    loader_val = DataLoader(
-        dset_val,
-        batch_size=1,
-        shuffle=False,
-        num_workers=0,
-        collate_fn=TrajectoryDataset.collate_fn
-    )
-
-print('Data loaded.')
-
-# -----------------------------------------------------------------------------
-# MODEL SETUP
-# -----------------------------------------------------------------------------
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-model = CTAG(
-    n_gcnn=args.n_gcnn,
-    n_tcnn=args.n_tcnn,
-    output_feat=args.output_size,
-    seq_len=args.obs_seq_len,
-    kernel_size=args.kernel_size,
-    pred_seq_len=args.pred_seq_len,
-    threshold=args.thres
-).to(device)
-# Optimizer and Scheduler
-# optimizer = optim.SGD(model.parameters(), lr=args.lr)
-optimizer = optim.Adam(model.parameters(), lr=0.001) # Lower LR for Adam
-if args.use_lrschd:
-    # Changed to ReduceLROnPlateau for better convergence checking
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, 
-        mode='min', 
-        factor=0.1, 
-        patience=10, 
-        threshold=1e-2, 
-        threshold_mode='abs',
-        min_lr=1e-4
-    )
-    # scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_sh_rate, gamma=0.2)
-else:
-    scheduler = None
 
 # -----------------------------------------------------------------------------
 # TRAINING FUNCTIONS
@@ -210,296 +100,337 @@ else:
 def train(epoch, model, optimizer, loader_train, metrics):
     model.train()
     loss_batch = 0 
-    batch_count = 0
-    is_fst_loss = True
-    loader_len = len(loader_train)
     
     # [ADDED] Progress Bar
     use_mse = (epoch < 30)
     desc_str = f"Epoch {epoch} [Train MSE]" if use_mse else f"Epoch {epoch} [Train NLL]"
-    pbar = tqdm(loader_train, desc=desc_str, unit="seq")
+    pbar = tqdm(loader_train, desc=desc_str, unit="batch")
 
     for cnt, batch in enumerate(pbar): 
-        batch_count += 1
-
         # 1. Unpack 
-        batch_tensors = batch[:-1] # Slice off metadata
-        # print("Batch tensors length:", len(batch_tensors))
-        # print('Batch metadata:', batch[-1]) # batch[-1] shows size of each sequence in the batch
-        batch_metadata = batch[-1][0] # it returns a tubple with feature map pt file name hence selecting [0]
+        batch_tensors = batch[:-1] 
+        batch_metadata_list = batch[-1]
         
         batch = [tensor.cuda() for tensor in batch_tensors]
         
         obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr = batch
 
+        optimizer.zero_grad() 
 
         # 3. Forward
-        # optimizer.zero_grad() # MOVED to step 5
         V_obs_tmp = V_obs.permute(0, 3, 1, 2)
-        
-        V_pred, _ = model(V_obs_tmp, A_obs,batch_metadata) 
-        
+        V_pred, _ = model(V_obs_tmp, A_obs, batch_metadata_list) 
         V_pred = V_pred.permute(0, 2, 3, 1)
         
-
         # 4. Loss
-        # Ensure mask is [Batch, Time, Nodes] to match V_pred structure
-        # loss_mask is [Batch, Nodes, Total_Time] -> Permute to [Batch, Total_Time, Nodes]
         mask_perm = loss_mask.permute(0, 2, 1)
-        
-        # SLICE MASK: The loss is calculated only on prediction steps
-        # loss_mask covers obs + pred. We take the last pred_seq_len steps.
         mask_perm = mask_perm[:, -args.pred_seq_len:, :]
         
-        # [FIX] V_tr from dataset is (B, T, V, C). 
-        # Loss expects (B, T, V, C).
-        # V_tr_perm = V_tr.permute(0, 3, 2, 1) # OLD BUG
+        V_tr_perm = V_tr 
+        loss = graph_loss(V_pred, V_tr_perm, mask_perm, use_mse=use_mse)
         
-        # It seems V_tr is ALREADY (B, T, V, C) based on utils_by_scene.py pad_V returning (T, N, D)
-        # So no permutation needed, or identity.
-        V_tr_perm = V_tr # (B, T, V, C)
-        
-        l = graph_loss(V_pred, V_tr_perm, mask_perm, use_mse=use_mse)
-        
-        # [ADDED] Check for NaN/Inf in individual batch loss
-        if torch.isnan(l) or torch.isinf(l) or (l.item() == 0 and epoch > 0):
-            # print(f"[WARNING] Invalid loss detected at Epoch {epoch}, Batch {cnt}. Value: {l.item()}")
-            # print("Skipping backward pass for this batch to avoid poisoning model weights.")
-            is_fst_loss = True
-            loss = 0
+        # Check for NaN
+        if torch.isnan(loss) or torch.isinf(loss) or (loss.item() == 0 and epoch > 0):
             continue 
 
-        if is_fst_loss:
-            loss = l
-            is_fst_loss = False
-        else:
-            loss = loss + l
-
-        # 5. Backprop (Gradient Accumulation)
-        turn_point = int(loader_len / args.batch_size) * args.batch_size + loader_len % args.batch_size - 1
+        # 5. Backprop
+        loss.backward()
         
-        if batch_count % args.batch_size == 0 or cnt == turn_point:
-            optimizer.zero_grad() # Correct placement for Gradient Accumulation
-            loss = loss / args.batch_size
-            loss.backward()
+        if args.clip_grad is not None:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
+        
+        optimizer.step()
+        
+        loss_batch += loss.item()
+        pbar.set_postfix({'Loss': loss_batch / (cnt + 1)})
             
-            # [MODIFIED] Only clip gradients if explicitly requested
-            if args.clip_grad is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
-            
-            optimizer.step()
-            
-            # Record metrics
-            current_loss = loss.item()
-            loss_batch += current_loss
-            
-            # Update Progress Bar with current loss
-            pbar.set_postfix({'Loss': loss_batch / (cnt + 1) * args.batch_size})
-            
-            is_fst_loss = True
-            loss = 0 
+    metrics['train_loss'].append(loss_batch / len(loader_train))
 
-    metrics['train_loss'].append(loss_batch / (loader_len / args.batch_size))
+
+def calculate_ade_fde(model, loader_val):
+    model.eval()
+    ade_batch_list = []
+    fde_batch_list = []
+    
+    # Use quiet progress bar or none to avoid spamming console if called inside vald
+    # pbar = tqdm(loader_val, desc="ADE/FDE", unit="batch") 
+
+    with torch.no_grad():
+        for batch in loader_val: 
+             batch_tensors = batch[:-1]
+             batch_metadata_list = batch[-1]
+             batch = [tensor.cuda() for tensor in batch_tensors]
+             obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr = batch
+
+             V_obs_tmp = V_obs.permute(0, 3, 1, 2)
+             V_pred, _ = model(V_obs_tmp, A_obs, batch_metadata_list)
+             V_pred = V_pred.permute(0, 2, 3, 1)
+
+             batch_size = V_pred.shape[0]
+             V_pred_np = V_pred.cpu().numpy()
+             V_tr_np = V_tr.cpu().numpy()
+             loss_mask_np = loss_mask.cpu().numpy()
+
+             pred_list = []
+             target_list = []
+             count_list = []
+
+             for i in range(batch_size):
+                 valid_rows = np.any(loss_mask_np[i] > 0, axis=1)
+                 num_valid = np.sum(valid_rows)
+                 if num_valid == 0: num_valid = 1 
+
+                 p_i = V_pred_np[i, :, :num_valid, :2]
+                 t_i = V_tr_np[i, :, :num_valid, :2]
+
+                 pred_list.append(p_i)
+                 target_list.append(t_i)
+                 count_list.append(num_valid)
+
+             ade_batch_list.append(ade(pred_list, target_list, count_list))
+             fde_batch_list.append(fde(pred_list, target_list, count_list))
+
+    final_ade = np.mean(ade_batch_list)
+    final_fde = np.mean(fde_batch_list)
+    
+    metrics['ade'].append(final_ade)
+    metrics['fde'].append(final_fde)
+    
+    # print(f"\tval ADE: {final_ade:.4f} | val FDE: {final_fde:.4f}")
+    
+    return final_ade, final_fde
 
 def vald(epoch, model, loader_val, metrics, constant_metrics):
     model.eval()
     loss_batch = 0 
-    batch_count = 0
-    is_fst_loss = True
-    loader_len = len(loader_val)
     
-    # [ADDED] Progress Bar
     use_mse = (epoch < 30)
     desc_str = f"Epoch {epoch} [Val MSE]" if use_mse else f"Epoch {epoch} [Val NLL]"
-    pbar = tqdm(loader_val, desc=desc_str, unit="seq")
+    pbar = tqdm(loader_val, desc=desc_str, unit="batch")
     
     with torch.no_grad():
         for cnt, batch in enumerate(pbar): 
-            batch_count += 1
-
-            batch_tensors = batch[:-1] # Slice off metadata
-            # print("Batch tensors length:", len(batch_tensors))
-            # print('Batch metadata:', batch[-1]) # batch[-1] shows size of each sequence in the batch
-            batch_metadata = batch[-1][0] # it returns a tubple with feature map pt file name hence selecting [0]
+            batch_tensors = batch[:-1] 
+            batch_metadata_list = batch[-1]
             
             batch = [tensor.cuda() for tensor in batch_tensors]
             obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr = batch
 
             V_obs_tmp = V_obs.permute(0, 3, 1, 2)
-            
-            V_pred, _ = model(V_obs_tmp, A_obs,batch_metadata)
+            V_pred, _ = model(V_obs_tmp, A_obs, batch_metadata_list)
             V_pred = V_pred.permute(0, 2, 3, 1)
             
             mask_perm = loss_mask.permute(0, 2, 1)
-            # SLICE MASK (Validation too)
             mask_perm = mask_perm[:, -args.pred_seq_len:, :]
             
-            # [FIX] V_tr from dataset is (B, T, V, C). 
             V_tr_perm = V_tr
-            
-            l = graph_loss(V_pred, V_tr_perm, mask_perm, use_mse=use_mse)
+            loss = graph_loss(V_pred, V_tr_perm, mask_perm, use_mse=use_mse)
 
-            if is_fst_loss:
-                loss = l
-                is_fst_loss = False
-            else:
-                loss = loss + l
-            
-            turn_point = int(loader_len / args.batch_size) * args.batch_size + loader_len % args.batch_size - 1
-            
-            if batch_count % args.batch_size == 0 or cnt == turn_point:
-                loss = loss / args.batch_size
-                loss_batch += loss.item()
-                is_fst_loss = True
-                loss = 0
-                pbar.set_postfix({'Loss': loss_batch / (cnt + 1) * args.batch_size})
+            loss_batch += loss.item()
+            pbar.set_postfix({'Loss': loss_batch / (cnt + 1)})
 
-    avg_val_loss = loss_batch / (loader_len / args.batch_size)
+    avg_val_loss = loss_batch / len(loader_val)
     metrics['val_loss'].append(avg_val_loss)
     
     if avg_val_loss < constant_metrics['min_val_loss']:
         constant_metrics['min_val_loss'] = avg_val_loss
         constant_metrics['min_val_epoch'] = epoch
-
-def calculate_ade_fde(model, loader_val):
-    model.eval()
-    ade_ls = []
-    fde_ls = []
     
-    print("Calculating ADE/FDE...")
-    pbar = tqdm(loader_val, desc="ADE/FDE", unit="seq")
-
-    with torch.no_grad():
-        for batch in pbar:
-            batch_tensors = batch[:-1]
-            batch_metadata = batch[-1][0]
-            batch = [tensor.cuda() for tensor in batch_tensors]
-            obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr = batch
-
-            V_obs_tmp = V_obs.permute(0, 3, 1, 2)
-            
-            V_pred, _ = model(V_obs_tmp, A_obs,batch_metadata)
-            V_pred = V_pred.permute(0, 2, 3, 1)
-
-            # --- FIX: Unpack Batch for ADE/FDE calculation ---
-            batch_size = V_pred.shape[0]
-            pred_list = []
-            target_list = []
-            count_list = []
-            
-            V_pred_np = V_pred.cpu().numpy()
-            # [FIX] V_tr also needs permutation here to match V_pred structure for ADE/FDE logic
-            V_tr_perm = V_tr
-            V_tr_np = V_tr_perm.cpu().numpy()
-            
-            loss_mask_np = loss_mask.cpu().numpy() # (B, N, T)
-            
-            for i in range(batch_size):
-                # Determine number of valid agents in this sequence
-                # loss_mask[i] is (N, T). Valid agents have non-zero entries (or we assume count from data loading)
-                # Simple heuristic: Count rows that are not all zeros (or consistent with valid mask)
-                # Since pad_mask appends zeros, we can just find the split point.
-                # However, loss_mask might be all 1s for valid and 0s for pad.
-                # Let's count agents with at least one valid time step.
-                valid_rows = np.any(loss_mask_np[i] > 0, axis=1)
-                num_valid = np.sum(valid_rows)
-                
-                if num_valid == 0: num_valid = 1 # Fallback
-                
-                # Extract valid part and only (x, y) coords
-                # V_pred is (B, T, N, 5). We take first 2 channels.
-                p_i = V_pred_np[i, :, :num_valid, :2] # (T, num_valid, 2)
-                t_i = V_tr_np[i, :, :num_valid, :2]   # (T, num_valid, 2)
-                
-                pred_list.append(p_i)
-                target_list.append(t_i)
-                count_list.append(num_valid)
-
-            ade_ls.append(ade(pred_list, target_list, count_list))
-            fde_ls.append(fde(pred_list, target_list, count_list))
-
-    return np.mean(ade_ls), np.mean(fde_ls)
+    # Calculate ADE/FDE using the helper function
+    # We call it here to record metrics during training loop if desired, 
+    # but the original code structure had it separate or returned.
+    # We will assume we want to track it.
+    ade_, fde_ = calculate_ade_fde(model, loader_val)
+    
+    # Note: calculate_ade_fde appends to metrics, so we don't need to do it here.
+    return ade_, fde_
 
 # -----------------------------------------------------------------------------
-# MAIN LOOP
+# MAIN EXECUTION
 # -----------------------------------------------------------------------------
 
-metrics = {'train_loss': [], 'val_loss': [], 'ade': [], 'fde': []}
-constant_metrics = {'min_val_epoch': -1, 'min_val_loss': 9999999999999999}
+if __name__ == '__main__':
+    print('*'*30)
+    print("Training initiating....")
+    print(args)
 
-best_val_loss = float('inf')
-best_model_state = None
+    # Create log directories
+    os.makedirs(args.log_dir, exist_ok=True)
+    checkpoint_dir = './checkpoint/'+args.tag+'/'
+    os.makedirs(checkpoint_dir, exist_ok=True)
 
-print("Starting Training Loop...")
+    # Log file setup
+    log_file = open(os.path.join(args.log_dir, time.ctime()+'_log.txt'), 'w')
+    log_file.write(str(args)+'\n')
+    log_file.write('Epoch,Train_loss,Val_loss,Val_ADE,Val_FDE\n')
 
-for epoch in range(args.num_epochs):
-    train(epoch, model, optimizer, loader_train, metrics)
-    
+    # Save args
+    with open(checkpoint_dir+'args.pkl', 'wb') as fp:
+        pickle.dump(args, fp)
+
+    # -----------------------------------------------------------------------------
+    # DATASET INITIALIZATION
+    # -----------------------------------------------------------------------------
+    processed_train_dir = os.path.join('./processed/train', args.scene_name)
+    processed_val_dir = os.path.join('./processed/val', args.scene_name)
+
+    # Check if processed data exists for this scene
+    files_exist = os.path.exists(processed_train_dir) and len(glob.glob(os.path.join(processed_train_dir, "*.pkl"))) > 0
+
+    if args.reload_data or not files_exist:
+        print(f"Processed data for {args.scene_name} missing or reload requested. Generating splits from RAW data...")
+        # This generates ALL scenes into ./processed
+        _ = TrajectoryDataset(
+            data_dir=args.dataset_path,
+            obs_len=args.obs_seq_len,
+            pred_len=args.pred_seq_len,
+            skip=1,
+            norm_lap_matr=True,
+            delim=args.delim,
+            dataset_name=args.dataset
+        )
+        print("Data generation complete.")
+
+    print(f"Initializing Datasets for Scene: {args.scene_name}...")
+
+    dset_train = TrajectoryDataset(
+        data_dir=processed_train_dir,
+        obs_len=args.obs_seq_len,
+        pred_len=args.pred_seq_len,
+        skip=1,
+        norm_lap_matr=True,
+        delim=args.delim,
+        dataset_name=args.dataset
+    )
+
+    loader_train = DataLoader(
+        dset_train,
+        batch_size=args.batch_size, # Use actual batch size for training
+        shuffle=args.shuffle,
+        num_workers=4,
+        collate_fn=TrajectoryDataset.collate_fn 
+    )
+
+    loader_val = None
     if not args.skip_val:
-        vald(epoch, model, loader_val, metrics, constant_metrics)
-    
-    # Scheduler
+        dset_val = TrajectoryDataset(
+            data_dir=processed_val_dir,
+            obs_len=args.obs_seq_len,
+            pred_len=args.pred_seq_len,
+            skip=1,
+            norm_lap_matr=True,
+            delim=args.delim,
+            dataset_name=args.dataset
+        )
+        loader_val = DataLoader(
+            dset_val,
+            batch_size=args.batch_size, # Use actual batch size for validation
+            shuffle=False,
+            num_workers=4,
+            collate_fn=TrajectoryDataset.collate_fn
+        )
+
+    print('Data loaded.')
+
+    # -----------------------------------------------------------------------------
+    # MODEL SETUP
+    # -----------------------------------------------------------------------------
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model = CTAG(
+        n_gcnn=args.n_gcnn,
+        n_tcnn=args.n_tcnn,
+        output_feat=args.output_size,
+        seq_len=args.obs_seq_len,
+        kernel_size=args.kernel_size,
+        pred_seq_len=args.pred_seq_len,
+        threshold=args.thres
+    ).to(device)
+    # Optimizer and Scheduler
+    # optimizer = optim.SGD(model.parameters(), lr=args.lr)
+    optimizer = optim.Adam(model.parameters(), lr=0.001) # Lower LR for Adam
     if args.use_lrschd:
-        if scheduler is not None:
-             # ReduceLROnPlateau requires a metric (validation loss usually)
-            #current_val_loss = metrics['val_loss'][-1] if len(metrics['val_loss']) > 0 else float('inf')
-            # base on train loss lr scheduler must work
-            current_train_loss = metrics['train_loss'][-1] if len(metrics['train_loss']) > 0 else float('inf')
+        # Changed to ReduceLROnPlateau for better convergence checking
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, 
+            mode='min', 
+            factor=0.1, 
+            patience=10, 
+            threshold=1e-2, 
+            threshold_mode='abs',
+            min_lr=1e-4
+        )
+        # scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_sh_rate, gamma=0.2)
+    else:
+        scheduler = None
+
+    # -----------------------------------------------------------------------------
+    # MAIN LOOP
+    # -----------------------------------------------------------------------------
     
+    metrics = {'train_loss': [], 'val_loss': [], 'ade': [], 'fde': []}
+    constant_metrics = {'min_val_epoch': -1, 'min_val_loss': 9999999999999999}
 
-            # Step with validation loss
-            # scheduler.step(current_val_loss)
+    best_val_loss = float('inf')
+    best_model_state = None
 
-            # Step with training loss
-            scheduler.step(current_train_loss)
+    print("Starting Training Loop...")
 
-            print(f"Learning Rate after Epoch {epoch}: {optimizer.param_groups[0]['lr']}")
-            # Old manual check (ReduceOnPlateau handles NaN internally usually, but safe to keep eye on logs)
-            if len(metrics['train_loss']) > 0 and np.isnan(metrics['train_loss'][-1]):
-                print("NaN loss detected.")
+    for epoch in range(args.num_epochs): 
+        train(epoch, model, optimizer, loader_train, metrics)
+        
+        if not args.skip_val:
+            vald(epoch, model, loader_val, metrics, constant_metrics)
+        
+        # Scheduler
+        if args.use_lrschd:
+            if scheduler is not None:
+                current_train_loss = metrics['train_loss'][-1] if len(metrics['train_loss']) > 0 else float('inf')
+                scheduler.step(current_train_loss)
+                print(f"Learning Rate after Epoch {epoch}: {optimizer.param_groups[0]['lr']}")
+                if len(metrics['train_loss']) > 0 and np.isnan(metrics['train_loss'][-1]):
+                    print("NaN loss detected.")
 
-    # Console Log
-    print(f'Epoch: {epoch} | Train Loss: {metrics["train_loss"][-1]:.4f} | Val Loss: {metrics["val_loss"][-1]:.4f}')
+        # Console Log
+        print(f'Epoch: {epoch} | Train Loss: {metrics["train_loss"][-1]:.4f} | Val Loss: {metrics["val_loss"][-1]:.4f}')
 
-    # Checkpoints
-    # Create checkpoint dict with metadata
-    checkpoint = {
-        'state_dict': model.state_dict(),
-        'scene_name': args.scene_name,
-        'args': args,
-        'epoch': epoch,
-        'metrics': metrics
-    }
-    
-    torch.save(checkpoint, os.path.join(checkpoint_dir, f'model_epoch{epoch}.pth'))
-    
-    curr_val_loss = metrics['val_loss'][-1] if len(metrics['val_loss']) > 0 else float('inf')
-    if curr_val_loss < best_val_loss:
-        best_val_loss = curr_val_loss
-        best_model_state = model.state_dict() # Keep distinct logical copy if needed, or just use checkpoint
-        # Save best model with same metadata structure
-        torch.save(checkpoint, os.path.join(checkpoint_dir, 'best_model.pth'))
+        # Checkpoints
+        checkpoint = {
+            'state_dict': model.state_dict(),
+            'scene_name': args.scene_name,
+            'args': args,
+            'epoch': epoch,
+            'metrics': metrics
+        }
+        
+        torch.save(checkpoint, os.path.join(checkpoint_dir, f'model_epoch{epoch}.pth'))
+        
+        curr_val_loss = metrics['val_loss'][-1] if len(metrics['val_loss']) > 0 else float('inf')
+        if curr_val_loss < best_val_loss:
+            best_val_loss = curr_val_loss
+            best_model_state = model.state_dict() 
+            torch.save(checkpoint, os.path.join(checkpoint_dir, 'best_model.pth'))
 
-    with open(os.path.join(checkpoint_dir, 'metrics.pkl'), 'wb') as fp:
-        pickle.dump(metrics, fp)
-    
-    t_loss = metrics['train_loss'][-1] if metrics['train_loss'] else 0
-    v_loss = metrics['val_loss'][-1] if metrics['val_loss'] else 0
-    log_file.write(f"{epoch},{t_loss},{v_loss},0,0\n")
+        with open(os.path.join(checkpoint_dir, 'metrics.pkl'), 'wb') as fp:
+            pickle.dump(metrics, fp)
+        
+        t_loss = metrics['train_loss'][-1] if metrics['train_loss'] else 0
+        v_loss = metrics['val_loss'][-1] if metrics['val_loss'] else 0
+        log_file.write(f"{epoch},{t_loss},{v_loss},0,0\n")
 
-if not args.skip_val:
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
-    elif os.path.exists(os.path.join(checkpoint_dir, 'best_model.pth')):
-        # Load checkpoint with weights_only=False because it contains args/Namespace
-        checkpoint = torch.load(os.path.join(checkpoint_dir, 'best_model.pth'), weights_only=False)
-        if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['state_dict'])
-        else:
-            model.load_state_dict(checkpoint)
-    
-    ade_calc, fde_calc = calculate_ade_fde(model, loader_val)
-    print(f"Final Best Model - ADE: {ade_calc:.4f}, FDE: {fde_calc:.4f}")
-    log_file.write(f"FINAL,,,{ade_calc},{fde_calc}\n")
+    if not args.skip_val:
+        if best_model_state is not None:
+            model.load_state_dict(best_model_state)
+        elif os.path.exists(os.path.join(checkpoint_dir, 'best_model.pth')):
+            checkpoint = torch.load(os.path.join(checkpoint_dir, 'best_model.pth'), weights_only=False)
+            if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['state_dict'])
+            else:
+                model.load_state_dict(checkpoint)
+        
+        ade_calc, fde_calc = calculate_ade_fde(model, loader_val)
+        print(f"Final Best Model - ADE: {ade_calc:.4f}, FDE: {fde_calc:.4f}")
+        log_file.write(f"FINAL,,,{ade_calc},{fde_calc}\n")
 
-log_file.close()
+    log_file.close()
+
