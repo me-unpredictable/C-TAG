@@ -75,7 +75,7 @@ parser.add_argument('--dataset', default='eth', help='Apolloscape,eth,hotel,univ
 parser.add_argument('--scene_name', default='bookstore', help='Scene name to train on [quad,nexus,little,hyang,gates,deathCircle,coupa,bookstore]')
 
 # Training specific parameters
-parser.add_argument('--batch_size', type=int, default=512, help='minibatch size (Virtual Batch Size for Gradient Accumulation)')
+parser.add_argument('--batch_size', type=int, default=128, help='minibatch size (Virtual Batch Size for Gradient Accumulation)')
 parser.add_argument('--num_epochs', type=int, default=150, help='number of epochs')
 parser.add_argument('--clip_grad', type=float, default=None, help='gradient clipping')
 parser.add_argument('--lr', type=float, default=0.1, help='learning rate')
@@ -147,7 +147,7 @@ def train(epoch, model, optimizer, loader_train, metrics):
     metrics['train_loss'].append(loss_batch / len(loader_train))
 
 
-def calculate_ade_fde(model, loader_val):
+def calculate_ade_fde(model, loader_val, metrics):
     model.eval()
     ade_batch_list = []
     fde_batch_list = []
@@ -164,11 +164,25 @@ def calculate_ade_fde(model, loader_val):
 
              V_obs_tmp = V_obs.permute(0, 3, 1, 2)
              V_pred, _ = model(V_obs_tmp, A_obs, batch_metadata_list)
-             V_pred = V_pred.permute(0, 2, 3, 1)
+             V_pred = V_pred.permute(0, 2, 3, 1) # [Batch, Time, Nodes, 5]
+
+             # Convert to Absolute Coordinates
+             V_pred_rel = V_pred[..., :2]
+             V_pred_cumsum = torch.cumsum(V_pred_rel, dim=1)
+             
+             # obs_traj is [Batch, Nodes, 2, Time]
+             last_obs = obs_traj[:, :, :, -1] # [Batch, Nodes, 2]
+             last_obs = last_obs.unsqueeze(1) # [Batch, 1, Nodes, 2]
+             
+             V_pred_abs = V_pred_cumsum + last_obs # [Batch, Time, Nodes, 2]
+             
+             # GT Absolute
+             # pred_traj_gt is [Batch, Nodes, 2, Time] -> Permute to [Batch, Time, Nodes, 2]
+             V_tr_abs = pred_traj_gt.permute(0, 3, 1, 2)
 
              batch_size = V_pred.shape[0]
-             V_pred_np = V_pred.cpu().numpy()
-             V_tr_np = V_tr.cpu().numpy()
+             V_pred_np = V_pred_abs.cpu().numpy()
+             V_tr_np = V_tr_abs.cpu().numpy()
              loss_mask_np = loss_mask.cpu().numpy()
 
              pred_list = []
@@ -240,8 +254,10 @@ def vald(epoch, model, loader_val, metrics, constant_metrics):
     # We call it here to record metrics during training loop if desired, 
     # but the original code structure had it separate or returned.
     # We will assume we want to track it.
-    ade_, fde_ = calculate_ade_fde(model, loader_val)
+    ade_, fde_ = calculate_ade_fde(model, loader_val, metrics)
     
+    print(f"\tEpoch {epoch} Val Stats - Loss: {avg_val_loss:.4f} | ADE: {ade_:.4f} | FDE: {fde_:.4f}")
+
     # Note: calculate_ade_fde appends to metrics, so we don't need to do it here.
     return ade_, fde_
 
@@ -351,15 +367,15 @@ if __name__ == '__main__':
     optimizer = optim.Adam(model.parameters(), lr=0.001) # Lower LR for Adam
     if args.use_lrschd:
         # Changed to ReduceLROnPlateau for better convergence checking
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, 
-            mode='min', 
-            factor=0.1, 
-            patience=10, 
-            threshold=1e-2, 
-            threshold_mode='abs',
-            min_lr=1e-4
-        )
+      scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, 
+    mode='min', 
+    factor=0.5,       # Reduce by 50% instead of 90%
+    patience=30,      # Wait 30 epochs before reducing (was 10)
+    threshold=1e-2, 
+    threshold_mode='abs',
+    min_lr=1e-5
+)
         # scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_sh_rate, gamma=0.2)
     else:
         scheduler = None
@@ -406,10 +422,16 @@ if __name__ == '__main__':
         torch.save(checkpoint, os.path.join(checkpoint_dir, f'model_epoch{epoch}.pth'))
         
         curr_val_loss = metrics['val_loss'][-1] if len(metrics['val_loss']) > 0 else float('inf')
-        if curr_val_loss < best_val_loss:
-            best_val_loss = curr_val_loss
+        
+        # Use Loss as primary metric for best model unless you want ADE
+        # save_metric = curr_val_loss 
+        save_metric = metrics['ade'][-1] # Uncomment to save based on ADE
+        
+        if save_metric < best_val_loss:
+            best_val_loss = save_metric
             best_model_state = model.state_dict() 
             torch.save(checkpoint, os.path.join(checkpoint_dir, 'best_model.pth'))
+            print(f"New Best Model Saved! ADE: {save_metric:.4f}")
 
         with open(os.path.join(checkpoint_dir, 'metrics.pkl'), 'wb') as fp:
             pickle.dump(metrics, fp)
@@ -428,7 +450,7 @@ if __name__ == '__main__':
             else:
                 model.load_state_dict(checkpoint)
         
-        ade_calc, fde_calc = calculate_ade_fde(model, loader_val)
+        ade_calc, fde_calc = calculate_ade_fde(model, loader_val, metrics)
         print(f"Final Best Model - ADE: {ade_calc:.4f}, FDE: {fde_calc:.4f}")
         log_file.write(f"FINAL,,,{ade_calc},{fde_calc}\n")
 

@@ -14,7 +14,7 @@ import torch.distributions.multivariate_normal as torchdist
 
 # Import your modules
 from model import CTAG
-from utils_by_scene import TrajectoryDataset, seq_collate
+from utils_by_scene import TrajectoryDataset 
 from metrics import ade, fde
 
 def get_model_path(checkpoint_root='./checkpoint/'):
@@ -69,14 +69,14 @@ def evaluate(model, loader, args, num_samples=20):
     ade_list = []
     fde_list = []
     
-    print(f"Starting evaluation (K={num_samples})...")
+    print(f"Starting evaluation...")
     pbar = tqdm(loader, desc="Evaluating")
     
     with torch.no_grad():
         for batch in pbar:
             # Unpack batch (consistent with train.py)
             batch_tensors = batch[:-1]
-            batch_metadata = batch[-1][0] # Tuple (file_path, ...)
+            batch_metadata = batch[-1] # Pass full list of metadata
             
             batch_tensors = [t.cuda() for t in batch_tensors]
             obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr = batch_tensors
@@ -86,112 +86,52 @@ def evaluate(model, loader, args, num_samples=20):
             
             # Forward pass
             V_pred, _ = model(V_obs_tmp, A_obs, batch_metadata)
-            V_pred = V_pred.permute(0, 2, 3, 1)
+            V_pred = V_pred.permute(0, 2, 3, 1) # [Batch, Time, Nodes, 5]
             
             # ------------------------------------------------------------------
-            # Best-of-N Sampling Logic
+            # Evaluation Logic (Standard Absolute ADE/FDE)
             # ------------------------------------------------------------------
             
-            batch_size = V_pred.size(0)
-            seq_len = V_pred.size(1)
-            num_ped = V_pred.size(2)
+            # Convert to Absolute Coordinates
+            V_pred_rel = V_pred[..., :2]
+            V_pred_cumsum = torch.cumsum(V_pred_rel, dim=1)
             
-            # Extract parameters
-            mu_x = V_pred[..., 0]
-            mu_y = V_pred[..., 1]
-            sx = torch.exp(torch.clamp(V_pred[..., 2], max=5.0)) # Clamp log-variance to avoid explosion
-            sy = torch.exp(torch.clamp(V_pred[..., 3], max=5.0))
-            corr = torch.tanh(V_pred[..., 4]) * 0.99 # Soft clamp correlation
+            # obs_traj is [Batch, Nodes, 2, Time]
+            last_obs = obs_traj[:, :, :, -1] # [Batch, Nodes, 2]
+            last_obs = last_obs.unsqueeze(1) # [Batch, 1, Nodes, 2]
             
-            # Build Covariance Matrix
-            cov = torch.zeros(batch_size, seq_len, num_ped, 2, 2).cuda()
-            cov[..., 0, 0] = sx * sx
-            cov[..., 0, 1] = corr * sx * sy
-            cov[..., 1, 0] = corr * sx * sy
-            cov[..., 1, 1] = sy * sy
+            V_pred_abs = V_pred_cumsum + last_obs # [Batch, Time, Nodes, 2]
             
-            mean = V_pred[..., 0:2]
+            # GT Absolute
+            # pred_traj_gt is [Batch, Nodes, 2, Time] -> Permute to [Batch, Time, Nodes, 2]
+            V_tr_abs = pred_traj_gt.permute(0, 3, 1, 2)
             
-            # Safe Multivariate Normal
-            epsilon = 1e-4
-            cov[..., 0, 0] += epsilon
-            cov[..., 1, 1] += epsilon
-            
-            try:
-                mvnormal = torchdist.MultivariateNormal(mean, cov)
-            except Exception as e:
-                print(f"Distribution error for batch: {e}")
-                # Fallback: diagonal only
-                cov[..., 0, 1] = 0
-                cov[..., 1, 0] = 0
-                mvnormal = torchdist.MultivariateNormal(mean, cov)
+            batch_size = V_pred.shape[0]
+            V_pred_np = V_pred_abs.cpu().numpy()
+            V_tr_np = V_tr_abs.cpu().numpy() # Absolute Target
+            loss_mask_np = loss_mask.cpu().numpy()
 
-            # Ground Truth (absolute coordinates)
-            # obs_traj: [Batch, NumPed, 2, SeqLen] (Check dimension ordering, usually comes from Dataset like this)
-            # In utils.py: seq_to_graph takes [NumNodes, 2, SeqLen]
-            # But the batch tensor is collated.
-            
-            # Usually: 
-            # obs_traj is [Batch, NumPed, 2, ObsLen]
-            # pred_traj_gt is [Batch, NumPed, 2, PredLen]
-            
-            # We need last observed position to convert relative predictions to absolute.
-            # last_obs: [Batch, NumPed, 2]
-            last_obs = obs_traj[:, :, :, -1] 
-            
-            batch_ade = []
-            batch_fde = []
-            
-            for _ in range(num_samples):
-                # Sample relative offsets: [Batch, SeqLen, NumPed, 2]
-                sample_rel = mvnormal.sample()
-                
-                # We need to change dimensions to match [Batch, NumPed, 2, SeqLen] or similar for easier math
-                # sample_rel is [Batch, SeqLen, NumPed, 2] -> permute to [Batch, NumPed, 2, SeqLen]
-                sample_rel_p = sample_rel.permute(0, 2, 3, 1) # [Batch, NumPed, 2, SeqLen]
-                
-                # Cumsum over time (last dim)
-                sample_cumsum = torch.cumsum(sample_rel_p, dim=-1)
-                
-                # Add starting position
-                # last_obs unsqueezed: [Batch, NumPed, 2, 1]
-                sample_abs = sample_cumsum + last_obs.unsqueeze(-1)
-                
-                # Get Ground Truth Absolute
-                # pred_traj_gt: [Batch, NumPed, 2, SeqLen]
-                gt_abs = pred_traj_gt
-                
-                # Calculate Error
-                diff = sample_abs - gt_abs
-                dist = torch.norm(diff, dim=2) # [Batch, NumPed, SeqLen] (Norm over x,y)
-                
-                # ADE: Mean over Time
-                ade_val = dist.mean(dim=-1) # [Batch, NumPed]
-                # FDE: Value at last Time
-                fde_val = dist[:, :, -1] # [Batch, NumPed]
-                
-                batch_ade.append(ade_val)
-                batch_fde.append(fde_val)
-            
-            # Best of K
-            batch_ade = torch.stack(batch_ade) # [K, Batch, NumPed]
-            batch_fde = torch.stack(batch_fde)
-            
-            min_ade, _ = torch.min(batch_ade, dim=0) # [Batch, NumPed]
-            min_fde, _ = torch.min(batch_fde, dim=0) # [Batch, NumPed]
-            
-            # --- FIX: Filter out dummy agents using loss_mask ---
-            # loss_mask is [Batch, NumPed, SeqLen]
-            # An agent is valid if it has non-zero entries in the mask (i.e. not padding)
-            agent_mask = loss_mask.sum(dim=-1) > 0 # [Batch, NumPed]
-            
-            valid_ade = min_ade[agent_mask]
-            valid_fde = min_fde[agent_mask]
-            
-            ade_list.extend(valid_ade.cpu().numpy().flatten().tolist())
-            fde_list.extend(valid_fde.cpu().numpy().flatten().tolist())
+            pred_list = []
+            target_list = []
+            count_list = []
 
-    print(f"\nFinal Results (Best-of-{num_samples}):")
+            for i in range(batch_size):
+                valid_rows = np.any(loss_mask_np[i] > 0, axis=1)
+                num_valid = np.sum(valid_rows)
+                if num_valid == 0: num_valid = 1 
+                
+                # Take Mean Prediction (mu_x, mu_y)
+                p_i = V_pred_np[i, :, :num_valid, :2]
+                t_i = V_tr_np[i, :, :num_valid, :2]
+
+                pred_list.append(p_i)
+                target_list.append(t_i)
+                count_list.append(num_valid)
+
+            ade_list.append(ade(pred_list, target_list, count_list))
+            fde_list.append(fde(pred_list, target_list, count_list))
+
+    print(f"\nFinal Results (Standard Absolute ADE/FDE):")
     print(f"ADE: {np.mean(ade_list):.4f}")
     print(f"FDE: {np.mean(fde_list):.4f}")
 
@@ -248,10 +188,10 @@ def main():
     
     loader_test = DataLoader(
         dset_test,
-        batch_size=1, 
+        batch_size=args.batch_size, 
         shuffle=False,
         num_workers=4,
-        collate_fn=seq_collate
+        collate_fn=TrajectoryDataset.collate_fn
     )
     
     # 4. Initialize Model
