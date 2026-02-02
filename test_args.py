@@ -85,7 +85,8 @@ def evaluate(model, loader, args, num_samples=20):
             V_obs_tmp = V_obs.permute(0, 3, 1, 2) 
             
             # Forward pass
-            V_pred, _ = model(V_obs_tmp, A_obs, batch_metadata)
+            model_metadata = [m[0] for m in batch_metadata]
+            V_pred, _ = model(V_obs_tmp, A_obs, model_metadata)
             V_pred = V_pred.permute(0, 2, 3, 1) # [Batch, Time, Nodes, 5]
             
             # ------------------------------------------------------------------
@@ -116,13 +117,25 @@ def evaluate(model, loader, args, num_samples=20):
             count_list = []
 
             for i in range(batch_size):
+                _, orig_w, orig_h = batch_metadata[i]
+                unscale_x = orig_w / 512.0
+                unscale_y = orig_h / 512.0
+                
                 valid_rows = np.any(loss_mask_np[i] > 0, axis=1)
                 num_valid = np.sum(valid_rows)
                 if num_valid == 0: num_valid = 1 
                 
                 # Take Mean Prediction (mu_x, mu_y)
-                p_i = V_pred_np[i, :, :num_valid, :2]
-                t_i = V_tr_np[i, :, :num_valid, :2]
+                p_i = V_pred_np[i, :, :num_valid, :2].copy()
+                t_i = V_tr_np[i, :, :num_valid, :2].copy()
+                
+                # --- APPLY UN-SCALING ---
+                p_i[..., 0] *= unscale_x
+                p_i[..., 1] *= unscale_y
+                
+                t_i[..., 0] *= unscale_x
+                t_i[..., 1] *= unscale_y
+                # ------------------------
 
                 pred_list.append(p_i)
                 target_list.append(t_i)

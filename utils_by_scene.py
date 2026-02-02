@@ -18,6 +18,7 @@ import sys
 import pickle
 import glob
 
+from PIL import Image
 import torch
 import torch.nn as nn
 import numpy as np
@@ -327,12 +328,31 @@ class TrajectoryDataset(Dataset):
                         meta_id = f"{scene_name}_{v}_map.pt" 
                         save_name = f"{scene_name}_{v}.pkl"
                         save_path = os.path.join(split_out_dir, save_name)
+
+                        img_path = os.path.join(current_scene_path, v, 'reference.jpg')
+                        # Check if reference.jpg exists, otherwise find any jpg
+                        if not os.path.exists(img_path):
+                            jpgs = glob.glob(os.path.join(current_scene_path, v, "*.jpg"))
+                            if len(jpgs) > 0: img_path = jpgs[0]
                         
                         print(f"Processing: {s_name} | {scene_name} | {v}")
-                        self._process_single_video(path, meta_id, save_path)
+                        self._process_single_video(path, meta_id, save_path, img_path)
 
-    def _process_single_video(self, file_path, meta_id, save_path):
+    def _process_single_video(self, file_path, meta_id, save_path, img_path):
         """Helper to process one video and save to disk immediately."""
+        
+        # 1. Calculate Scale Factors
+        if os.path.exists(img_path):
+            with Image.open(img_path) as img:
+                orig_w, orig_h = img.size
+        else:
+            # Fallback if no image (unsafe, but prevents crash)
+            print(f"Warning: No image found for {meta_id}, assuming 1.0 scale")
+            orig_w, orig_h = 512, 512
+
+        scale_x = 512.0 / orig_w
+        scale_y = 512.0 / orig_h
+
         if 'sdd' in self.dataset_name.lower():
             raw_data = read_file(file_path, self.delim)
             if raw_data.shape[1] >= 6: 
@@ -343,6 +363,10 @@ class TrajectoryDataset(Dataset):
                 data = np.stack((frame_id, track_id, center_x, center_y), axis=1)
             else:
                 data = raw_data[:, :4]
+            
+            # --- APPLY SCALING HERE ---
+            data[:, 2] = data[:, 2] * scale_x # Scale X
+            data[:, 3] = data[:, 3] * scale_y # Scale Y
         else:
             data = read_file(file_path, self.delim)
         
@@ -406,7 +430,7 @@ class TrajectoryDataset(Dataset):
                 non_linear_ped_list.append(np.array(_non_linear_ped))
                 num_peds_in_seq.append(num_peds_considered)
                 loss_mask_list.append(curr_loss_mask[:num_peds_considered])
-                seq_meta_list.append(meta_id)
+                seq_meta_list.append((meta_id, orig_w, orig_h))
                 
                 s_ = curr_seq[:num_peds_considered]
                 s_rel_ = curr_seq_rel[:num_peds_considered]

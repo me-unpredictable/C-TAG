@@ -119,7 +119,11 @@ def train(epoch, model, optimizer, loader_train, metrics):
 
         # 3. Forward
         V_obs_tmp = V_obs.permute(0, 3, 1, 2)
-        V_pred, _ = model(V_obs_tmp, A_obs, batch_metadata_list) 
+        
+        # Extract map filenames from metadata tuples
+        model_metadata = [m[0] for m in batch_metadata_list]
+        
+        V_pred, _ = model(V_obs_tmp, A_obs, model_metadata) 
         V_pred = V_pred.permute(0, 2, 3, 1)
         
         # 4. Loss
@@ -152,37 +156,26 @@ def calculate_ade_fde(model, loader_val, metrics):
     ade_batch_list = []
     fde_batch_list = []
     
-    # Use quiet progress bar or none to avoid spamming console if called inside vald
-    # pbar = tqdm(loader_val, desc="ADE/FDE", unit="batch") 
-
     with torch.no_grad():
         for batch in loader_val: 
              batch_tensors = batch[:-1]
-             batch_metadata_list = batch[-1]
+             batch_metadata_list = batch[-1] # Now a list of tuples: [(name, w, h), ...]
+             
              batch = [tensor.cuda() for tensor in batch_tensors]
              obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr = batch
 
              V_obs_tmp = V_obs.permute(0, 3, 1, 2)
-             V_pred, _ = model(V_obs_tmp, A_obs, batch_metadata_list)
-             V_pred = V_pred.permute(0, 2, 3, 1) # [Batch, Time, Nodes, 5]
-
-             # Convert to Absolute Coordinates
-             V_pred_rel = V_pred[..., :2]
-             V_pred_cumsum = torch.cumsum(V_pred_rel, dim=1)
              
-             # obs_traj is [Batch, Nodes, 2, Time]
-             last_obs = obs_traj[:, :, :, -1] # [Batch, Nodes, 2]
-             last_obs = last_obs.unsqueeze(1) # [Batch, 1, Nodes, 2]
+             # Extract just the map filenames for the model (it expects strings or tuples)
+             # The model needs just the filename to load the map.
+             model_metadata = [m[0] for m in batch_metadata_list] 
              
-             V_pred_abs = V_pred_cumsum + last_obs # [Batch, Time, Nodes, 2]
-             
-             # GT Absolute
-             # pred_traj_gt is [Batch, Nodes, 2, Time] -> Permute to [Batch, Time, Nodes, 2]
-             V_tr_abs = pred_traj_gt.permute(0, 3, 1, 2)
+             V_pred, _ = model(V_obs_tmp, A_obs, model_metadata)
+             V_pred = V_pred.permute(0, 2, 3, 1)
 
              batch_size = V_pred.shape[0]
-             V_pred_np = V_pred_abs.cpu().numpy()
-             V_tr_np = V_tr_abs.cpu().numpy()
+             V_pred_np = V_pred.cpu().numpy()
+             V_tr_np = V_tr.cpu().numpy()
              loss_mask_np = loss_mask.cpu().numpy()
 
              pred_list = []
@@ -190,12 +183,30 @@ def calculate_ade_fde(model, loader_val, metrics):
              count_list = []
 
              for i in range(batch_size):
+                 # Get dimensions for this specific sequence
+                 _, orig_w, orig_h = batch_metadata_list[i]
+                 
+                 # Calculate the "Un-Scale" factor
+                 # If we multiplied by (512/W), we now multiply by (W/512) to get back.
+                 unscale_x = orig_w / 512.0
+                 unscale_y = orig_h / 512.0
+                 
                  valid_rows = np.any(loss_mask_np[i] > 0, axis=1)
                  num_valid = np.sum(valid_rows)
                  if num_valid == 0: num_valid = 1 
 
-                 p_i = V_pred_np[i, :, :num_valid, :2]
-                 t_i = V_tr_np[i, :, :num_valid, :2]
+                 # Get raw predictions [Nodes, Time, 2]
+                 p_i = V_pred_np[i, :, :num_valid, :2].copy() # Copy to avoid modifying original tensor
+                 t_i = V_tr_np[i, :, :num_valid, :2].copy()
+
+                 # --- APPLY UN-SCALING ---
+                 # x is index 0, y is index 1
+                 p_i[..., 0] *= unscale_x
+                 p_i[..., 1] *= unscale_y
+                 
+                 t_i[..., 0] *= unscale_x
+                 t_i[..., 1] *= unscale_y
+                 # ------------------------
 
                  pred_list.append(p_i)
                  target_list.append(t_i)
@@ -209,8 +220,6 @@ def calculate_ade_fde(model, loader_val, metrics):
     
     metrics['ade'].append(final_ade)
     metrics['fde'].append(final_fde)
-    
-    # print(f"\tval ADE: {final_ade:.4f} | val FDE: {final_fde:.4f}")
     
     return final_ade, final_fde
 
@@ -231,7 +240,11 @@ def vald(epoch, model, loader_val, metrics, constant_metrics):
             obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr = batch
 
             V_obs_tmp = V_obs.permute(0, 3, 1, 2)
-            V_pred, _ = model(V_obs_tmp, A_obs, batch_metadata_list)
+            
+            # Extract map filenames
+            model_metadata = [m[0] for m in batch_metadata_list]
+            
+            V_pred, _ = model(V_obs_tmp, A_obs, model_metadata)
             V_pred = V_pred.permute(0, 2, 3, 1)
             
             mask_perm = loss_mask.permute(0, 2, 1)
@@ -438,7 +451,9 @@ if __name__ == '__main__':
         
         t_loss = metrics['train_loss'][-1] if metrics['train_loss'] else 0
         v_loss = metrics['val_loss'][-1] if metrics['val_loss'] else 0
-        log_file.write(f"{epoch},{t_loss},{v_loss},0,0\n")
+        curr_ade = metrics['ade'][-1] if metrics['ade'] else 0
+        curr_fde = metrics['fde'][-1] if metrics['fde'] else 0
+        log_file.write(f"{epoch},{t_loss},{v_loss},{curr_ade},{curr_fde}\n")
 
     if not args.skip_val:
         if best_model_state is not None:
