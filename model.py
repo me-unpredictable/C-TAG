@@ -170,21 +170,24 @@ class st_gcn(nn.Module):
 
 class VSIE(nn.Module):
     # Visual Spatio-Temporal Interaction Encoder
-    def __init__(self,in_feat,th):
-        super(VSIE,self).__init__()
-        self.th=th
-        self.encoder= nn.LSTM(in_feat,in_feat*2,batch_first=True)
-        self.fc=nn.Linear(in_feat*2,in_feat*4)
-        self.fc2=nn.Linear(in_feat,in_feat*4)
-        self.fc3=nn.Linear(in_feat,in_feat*4)
-        self.fc_out=nn.Linear(in_feat*4,in_feat)
+    def __init__(self, in_feat, output_dim, th):
+        super(VSIE, self).__init__()
+        self.th = th
+        self.encoder = nn.LSTM(in_feat, in_feat*2, batch_first=True)
+        self.fc = nn.Linear(in_feat*2, in_feat*4)
+        self.fc2 = nn.Linear(in_feat, in_feat*4)
+        self.fc3 = nn.Linear(in_feat, in_feat*4)
+        self.fc_out = nn.Linear(in_feat*4, output_dim)
 
-        # C-TAG: Visual Context Layers
-        self.compressor = nn.Conv2d(in_channels=2048, out_channels=32, kernel_size=1)
-        self.visual_fusion = nn.Linear((in_feat*2) + 32, in_feat*2)
+        # --- C-TAG CAPACITY FIX ---
+        # 1. Widen Compressor: 2048 -> 256 (Was 32)
+        #    This preserves 8x more visual detail from the ResNet map.
+        self.compressor = nn.Conv2d(in_channels=2048, out_channels=256, kernel_size=1)
+        
+        # 2. Widen Fusion Layer: Input is Motion(in_feat*2) + Visual(256)
+        self.visual_fusion = nn.Linear((in_feat*2) + 256, in_feat*2)
 
     def extract_local_context(self, feature_map, agent_coords, img_w=512.0, img_h=512.0):
-        # Helper to sample features at agent locations.
         batch_size, channels, h_dim, w_dim = feature_map.shape
         _, _, time_steps, num_nodes = agent_coords.shape
         
@@ -195,6 +198,7 @@ class VSIE(nn.Module):
         flat_coords = coords.reshape(batch_size, -1, 1, 2)
         
         # Normalize to [-1, 1] for grid_sample
+        # (Assumes coordinates are already scaled to 0-512 in utils_by_scene.py)
         norm_coords = torch.zeros_like(flat_coords)
         norm_coords[..., 0] = 2 * (flat_coords[..., 0] / img_w) - 1 # X
         norm_coords[..., 1] = 2 * (flat_coords[..., 1] / img_h) - 1 # Y
@@ -202,7 +206,8 @@ class VSIE(nn.Module):
         # Grid sample
         sampled = Func.grid_sample(feature_map, norm_coords, align_corners=False)
         
-        # Reshape to [Batch, Time, Nodes, 32]
+        # Reshape to [Batch, Time, Nodes, Channels]
+        # Channels will automatically match the compressor output (256)
         local_context = sampled.squeeze(-1).permute(0, 2, 1).view(batch_size, time_steps, num_nodes, channels)
         return local_context
 
@@ -220,20 +225,14 @@ class VSIE(nn.Module):
         plt.show()
 
     def threshold_relu(self, x, threshold, num_nodes):
-        # CRITICAL FIX: Use masking logic instead of selecting detached zeros
-        # Old: return torch.where(x > threshold, x, torch.zeros_like(x)) <-- Breaks Graph
-        # New: Multiply by binary mask. This keeps x in the graph.
+        # Masking logic to preserve graph structure
         mask = (x > threshold).float()
         return x * mask
 
     def positional_encoding(self, x):
-        # Correctly apply positional encoding to the time dimension
-        # Input x: [Batch, Time, Nodes, Features]
-        
         if x.dim() == 4:
             batch_size, seq_len, num_nodes, in_feat = x.size()
         elif x.dim() == 3:
-            # Fallback for [Time, Nodes, Features]
             seq_len, num_nodes, in_feat = x.size()
         else:
             return x
@@ -248,7 +247,6 @@ class VSIE(nn.Module):
         if in_feat > 1:
             pos_enc[:, 1::2] = torch.cos(position * div_term)
 
-        # Reshape for broadcasting [1, T, 1, C]
         if x.dim() == 4:
             pos_enc = pos_enc.unsqueeze(0).unsqueeze(2)
         else:
@@ -256,99 +254,67 @@ class VSIE(nn.Module):
              
         return x + pos_enc
 
-    def forward(self,x,metadata):
-        # Input x is [Batch, Channel, Time, Nodes] = [B, 2, T, V]
+    def forward(self, x, metadata):
+        # Input x is [Batch, Channel, Time, Nodes]
         x_input_coords = x.clone() 
         x_original = x.shape 
 
-        # Fix: Permute to [Batch, Time, Nodes, Channel] for PE and LSTM
-        # Requires x to be [B, C, T, V]
         if x.dim() == 4 and x.size(1) == 2:
             x = x.permute(0, 2, 3, 1) # [B, T, V, C]
         
-        # Apply PE (expects [B, T, V, C])
         x = self.positional_encoding(x)
-
-        # Flatten for LSTM [B*T*V, C] -> LSTM -> [B*T*V, C*2]
-        # NOTE: LSTM expects 3D input. If previous code worked with 2D, it might be auto-unsqeezing or
-        # treating as (L, N, H) or (N, L, H).
-        # To strictly maintain logic but fix OOM, we must respect Batch boundaries.
         
         b, t, n, c_in = x.size()
+        x_reshaped = x.contiguous().view(-1, c_in) 
         
-        # Reshape to [B * T * V, 1, C] for LSTM if we want to treat each node-time as independent sequence of len 1?
-        # Or [B * V, T, C] if we want temporal LSTM?
-        # Given "x_reshaped = x.contiguous().view(-1, 2)", it merges everything.
-        # Assuming original intent was just embedding, but using LSTM? 
-        # We will keep the Flatten-Run-Flatten logic but reshape for Attention.
-        
-        x_reshaped = x.contiguous().view(-1, c_in) # [B*T*V, C]
-        
-        # Assuming encoder handles 2D input by treating it as (Batch=N, Seq=1, Feat) or similar.
-        # We unsqueeze to be safe: [N, 1, C]
         X_lstm, _ = self.encoder(x_reshaped.unsqueeze(1)) 
         X = X_lstm.squeeze(1) # [B*T*V, C*2]
 
         # --- C-TAG FUSION LOGIC ---
         if metadata is not None:
-            batch_size = x_original[0] # Original B from [B, C, T, V]
+            batch_size = x_original[0]
             
             if metadata.size(0) != batch_size:
                 visual_map = metadata.expand(batch_size, -1, -1, -1)
             else:
                 visual_map = metadata
                 
-            compressed_map = self.compressor(visual_map)
-            # extract_local_context handles per-structure coords, but requires input [B, C, T, V]
-            # x_input_coords is still [B, C, T, V]
+            compressed_map = self.compressor(visual_map) # Output is now 256 channels
             local_context = self.extract_local_context(compressed_map, x_input_coords)
-            local_context_flat = local_context.reshape(X.shape[0], 32)
+            
+            # 3. DYNAMIC RESHAPE (Critical Fix)
+            # Use -1 so it automatically adapts to 256 (or any other size)
+            local_context_flat = local_context.reshape(X.shape[0], -1)
             
             fused_features = torch.cat([X, local_context_flat], dim=-1)
             X = self.visual_fusion(fused_features)
             
-        Q = self.fc(X)     # [B*T*V, 4C]
-        K = self.fc2(x_reshaped) # [B*T*V, 4C]
-        v = self.fc3(x_reshaped) # [B*T*V, 4C]
+        Q = self.fc(X)     
+        K = self.fc2(x_reshaped) 
+        v = self.fc3(x_reshaped) 
         
-        # --- BATCHED ATTENTION START ---
-        # Reshape to [B, T*V, Features] to compute attention per sample
+        # Batched Attention
         q_dim = Q.shape[-1]
+        Q_batched = Q.view(b, t * n, -1) 
+        K_batched = K.view(b, t * n, -1) 
+        v_batched = v.view(b, t * n, -1) 
         
-        Q_batched = Q.view(b, t * n, -1) # [B, T*V, 4C]
-        K_batched = K.view(b, t * n, -1) # [B, T*V, 4C]
-        v_batched = v.view(b, t * n, -1) # [B, T*V, 4C]
-        
-        # Batched Matmul: (B, TV, D) x (B, D, TV) -> (B, TV, TV)
         attn_scores = torch.bmm(Q_batched, K_batched.transpose(1, 2))
         attn_probs = Func.sigmoid(attn_scores)
-        
-        # Apply to V: (B, TV, TV) x (B, TV, D) -> (B, TV, D)
         out_batched = torch.bmm(attn_probs, v_batched)
         
-        # Flatten back to [B*T*V, 4C]
         out = out_batched.view(-1, q_dim)
-        # --- BATCHED ATTENTION END ---
         
-        # Threshold logic requires careful dimension handling
-        # x_original[3] is Nodes if input was [B, 2, T, V]
-        # But we are in flat land.
-        out=self.threshold_relu(out,self.th,x_original[3]) 
+        out = self.threshold_relu(out, self.th, x_original[3]) 
+        out = self.fc_out(out)
         
-        out=self.fc_out(out)
-        
-        # Reshape back to [Batch, Time, Nodes, Channels]
-        # x input to PE was [B, T, V, C].
-        b, t, n, c = x.size()
-        out = out.view(b, t, n, -1) # [B, T, V, C_out]
-        
-        # Permute back to [Batch, Channel, Time, Nodes]
+        out = out.view(b, t, n, -1) 
         out = out.permute(0, 3, 1, 2)
         
         return out
-
+    
 class TemporalTransformer(nn.Module):
-    def __init__(self, in_channels, seq_len, pred_seq_len, d_model=128, nhead=4, num_layers=4):
+    def __init__(self, in_channels, out_channels, seq_len, pred_seq_len, d_model=128, nhead=4, num_layers=4):
         super(TemporalTransformer, self).__init__()
         self.d_model = d_model
         self.seq_len = seq_len
@@ -375,8 +341,9 @@ class TemporalTransformer(nn.Module):
         self.output_proj = nn.Sequential(
             nn.Linear(self.flatten_dim, d_model * 2),
             nn.ReLU(),
-            nn.Linear(d_model * 2, pred_seq_len * in_channels)
+            nn.Linear(d_model * 2, pred_seq_len * out_channels) # Uses out_channels (5)
         )
+        self.out_channels = out_channels # Store for reshape
 
     def forward(self, x):
         # x input shape: (N, C, T, V) from GCN
@@ -402,43 +369,47 @@ class TemporalTransformer(nn.Module):
         out = self.output_proj(x) # (HV, PredT*C)
         
         # Reshape to (N, C, PredT, V) to match expected output
-        out = out.view(N, V, self.pred_seq_len, C)
-        out = out.permute(0, 3, 2, 1).contiguous() # (N, C, PredT, V)
-        
+        out = out.view(N, V, self.pred_seq_len, self.out_channels) # Uses 5
+        out = out.permute(0, 3, 2, 1).contiguous() 
         return out
 
 
 class CTAG(nn.Module):
-    def __init__(self,threshold,n_gcnn =1,n_tcnn=1,input_feat=2,output_feat=5,
-                 seq_len=8,pred_seq_len=12,kernel_size=3):
-        super(CTAG,self).__init__()
-        self.vsie = VSIE(input_feat,threshold) 
+    def __init__(self, threshold, n_gcnn=1, n_tcnn=1, input_feat=2, output_feat=5,
+                 seq_len=8, pred_seq_len=12, kernel_size=3, hidden_size=64):
+        super(CTAG, self).__init__()
+        self.vsie = VSIE(input_feat, hidden_size, threshold)
         self.n_gcnn= n_gcnn
         self.n_tcnn = n_tcnn
                 
         self.st_gcns = nn.ModuleList()
-        self.st_gcns.append(st_gcn(input_feat,output_feat,(kernel_size,seq_len)))
-        for j in range(1,self.n_gcnn):
-            self.st_gcns.append(st_gcn(output_feat,output_feat,(kernel_size,seq_len)))
+        self.st_gcns.append(st_gcn(hidden_size, hidden_size, (kernel_size, seq_len)))
+        for j in range(1, self.n_gcnn):
+            self.st_gcns.append(st_gcn(hidden_size, hidden_size, (kernel_size, seq_len)))
 
         # REPLACEMENT: Transformer for Temporal Pattern Extraction
         # We reuse n_tcnn to scale the transformer (e.g. layers)
         # Using d_model=128 to ensure capacity for SDD patterns
+        
+        # 3. Transformer takes 64 channels in, projects to 5 out
         self.temporal_transformer = TemporalTransformer(
-            in_channels=output_feat,
+            in_channels=hidden_size,    # Input is 64
+            out_channels=output_feat,   # [FIX] Added this argument (5)
             seq_len=seq_len,
             pred_seq_len=pred_seq_len,
             d_model=128,
             nhead=4,
-            num_layers=max(2, n_tcnn) # Ensure at least 2 layers
+            num_layers=max(2, n_tcnn)
         )
+            
+        self.prelus = nn.ModuleList()
         
         # Legacy: Keeping prelus definition if needed to avoid breaking state_dict loading (though logic changes)
         # But for new model structure, we don't use them. 
         # Since user asked to modify model.py, we can change architecture.
         # self.tpcnns = nn.ModuleList() ... (Removed)
             
-        self.prelus = nn.ModuleList() # Placeholder or remove if not used in forward
+        
         
     def forward(self,v,a,metadata=None):
         assert metadata is not None, "Metadata is required for CTAG model"
@@ -476,7 +447,7 @@ class CTAG(nn.Module):
 
         # Pass to VSIE (Compressor inside VSIE will attach grad)
         v = self.vsie(v, map_tensor) 
-
+        # v = self.vsie(v, None) # run this to check if map has a bug
         for k in range(self.n_gcnn):
             v, a = self.st_gcns[k](v, a)
 

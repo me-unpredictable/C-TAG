@@ -75,7 +75,7 @@ parser.add_argument('--dataset', default='eth', help='Apolloscape,eth,hotel,univ
 parser.add_argument('--scene_name', default='bookstore', help='Scene name to train on [quad,nexus,little,hyang,gates,deathCircle,coupa,bookstore]')
 
 # Training specific parameters
-parser.add_argument('--batch_size', type=int, default=128, help='minibatch size (Virtual Batch Size for Gradient Accumulation)')
+parser.add_argument('--batch_size', type=int, default=64, help='minibatch size (Virtual Batch Size for Gradient Accumulation)')
 parser.add_argument('--num_epochs', type=int, default=150, help='number of epochs')
 parser.add_argument('--clip_grad', type=float, default=None, help='gradient clipping')
 parser.add_argument('--lr', type=float, default=0.1, help='learning rate')
@@ -159,23 +159,40 @@ def calculate_ade_fde(model, loader_val, metrics):
     with torch.no_grad():
         for batch in loader_val: 
              batch_tensors = batch[:-1]
-             batch_metadata_list = batch[-1] # Now a list of tuples: [(name, w, h), ...]
+             batch_metadata_list = batch[-1]
              
              batch = [tensor.cuda() for tensor in batch_tensors]
+             # Note: We need obs_traj (for last pos) and pred_traj_gt (for absolute target)
              obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr = batch
 
              V_obs_tmp = V_obs.permute(0, 3, 1, 2)
-             
-             # Extract just the map filenames for the model (it expects strings or tuples)
-             # The model needs just the filename to load the map.
              model_metadata = [m[0] for m in batch_metadata_list] 
              
              V_pred, _ = model(V_obs_tmp, A_obs, model_metadata)
-             V_pred = V_pred.permute(0, 2, 3, 1)
+             V_pred = V_pred.permute(0, 2, 3, 1) # [Batch, Time, Nodes, 5]
+
+             # --- INTEGRATION LOGIC (Make Absolute) ---
+             # 1. Get Relative predictions (dx, dy)
+             V_pred_rel = V_pred[..., :2]
+             
+             # 2. Integrate offsets
+             V_pred_cumsum = torch.cumsum(V_pred_rel, dim=1)
+             
+             # 3. Add Last Observed Position
+             # obs_traj is [Batch, Nodes, 2, Time] -> Get last time step
+             last_obs = obs_traj[:, :, :, -1] # [Batch, Nodes, 2]
+             last_obs = last_obs.unsqueeze(1) # [Batch, 1, Nodes, 2]
+             
+             # 4. Final Absolute Prediction (Scaled 0-512)
+             V_pred_abs = V_pred_cumsum + last_obs # [Batch, Time, Nodes, 2]
+             
+             # 5. Prepare Target (Absolute)
+             # pred_traj_gt is [Batch, Nodes, 2, Time] -> Permute to [Batch, Time, Nodes, 2]
+             V_tr_abs = pred_traj_gt.permute(0, 3, 1, 2)
 
              batch_size = V_pred.shape[0]
-             V_pred_np = V_pred.cpu().numpy()
-             V_tr_np = V_tr.cpu().numpy()
+             V_pred_np = V_pred_abs.cpu().numpy()
+             V_tr_np = V_tr_abs.cpu().numpy()
              loss_mask_np = loss_mask.cpu().numpy()
 
              pred_list = []
@@ -183,11 +200,8 @@ def calculate_ade_fde(model, loader_val, metrics):
              count_list = []
 
              for i in range(batch_size):
-                 # Get dimensions for this specific sequence
                  _, orig_w, orig_h = batch_metadata_list[i]
                  
-                 # Calculate the "Un-Scale" factor
-                 # If we multiplied by (512/W), we now multiply by (W/512) to get back.
                  unscale_x = orig_w / 512.0
                  unscale_y = orig_h / 512.0
                  
@@ -195,12 +209,10 @@ def calculate_ade_fde(model, loader_val, metrics):
                  num_valid = np.sum(valid_rows)
                  if num_valid == 0: num_valid = 1 
 
-                 # Get raw predictions [Nodes, Time, 2]
-                 p_i = V_pred_np[i, :, :num_valid, :2].copy() # Copy to avoid modifying original tensor
+                 p_i = V_pred_np[i, :, :num_valid, :2].copy()
                  t_i = V_tr_np[i, :, :num_valid, :2].copy()
 
                  # --- APPLY UN-SCALING ---
-                 # x is index 0, y is index 1
                  p_i[..., 0] *= unscale_x
                  p_i[..., 1] *= unscale_y
                  
@@ -383,7 +395,7 @@ if __name__ == '__main__':
       scheduler = optim.lr_scheduler.ReduceLROnPlateau(
     optimizer, 
     mode='min', 
-    factor=0.5,       # Reduce by 50% instead of 90%
+    factor=0.1,       # Reduce by 10% instead of 90%
     patience=30,      # Wait 30 epochs before reducing (was 10)
     threshold=1e-2, 
     threshold_mode='abs',
