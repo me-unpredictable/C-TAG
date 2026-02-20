@@ -332,7 +332,7 @@ class TemporalTransformer(nn.Module):
         self.pos_encoder.data[0, :, 1::2] = torch.cos(position * div_term)
 
         # Transformer Encoder
-        encoder_layers = nn.TransformerEncoderLayer(d_model, nhead, dim_feedforward=512, dropout=0.1, batch_first=True)
+        encoder_layers = nn.TransformerEncoderLayer(d_model, nhead, dim_feedforward=512, dropout=0.4, batch_first=True) # higher dropout to reduce the overconfidance of transformer
         self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers)
 
         # Output Projection (Flatten T -> Linear -> PredT)

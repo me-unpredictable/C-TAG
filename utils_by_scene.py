@@ -8,6 +8,7 @@ Description:
     - Padding Collation (Enables Batch_Size > 1)
     - Correct Metadata Naming (Matches map_utils.py)
     - Lazy Loading (Handles large datasets like SDD)
+    - Dynamic Filtering of Stationary Agents (min_displacement)
 
 Author: me__unpredictable (vishal patel) https://vishalresearch.com
 """
@@ -37,18 +38,11 @@ def normalize_adj_dense(mx):
     Row-normalize dense matrix (Symmetrical Normalization for GCN).
     Formula: D^{-0.5} * A * D^{-0.5}
     """
-    # Add self-loops (Identity matrix)
     mx = mx + np.eye(mx.shape[0])
-    
-    # Calculate degree matrix D
     rowsum = np.array(mx.sum(1))
-    
-    # Inverse square root of degree
     r_inv = np.power(rowsum, -0.5).flatten()
     r_inv[np.isinf(r_inv)] = 0.
     r_mat_inv = np.diag(r_inv)
-    
-    # D^{-0.5} * A * D^{-0.5}
     mx = r_mat_inv.dot(mx).dot(r_mat_inv)
     return mx
                 
@@ -75,22 +69,18 @@ def seq_to_graph(seq_, seq_rel, norm_lap_matr=True):
     V = np.zeros((seq_len, num_nodes, 2))
     A = np.zeros((seq_len, num_nodes, num_nodes))
 
-    # --- VECTORIZED LOOP OVER TIME ---
     for s in range(seq_len):
         V[s, :, :] = seq_rel_np[:, :, s]
-        pos_s = seq_np[:, :, s] # [N, 2]
+        pos_s = seq_np[:, :, s]
         
-        # Broadcasting for Pairwise Differences [N, N, 2]
         diff = pos_s[:, np.newaxis, :] - pos_s[np.newaxis, :, :]
-        dists = np.linalg.norm(diff, axis=2) # [N, N]
+        dists = np.linalg.norm(diff, axis=2)
 
-        # Inverse Distance (Adjacency)
         with np.errstate(divide='ignore', invalid='ignore'):
             adj_mat = np.zeros_like(dists)
             mask = dists != 0
             adj_mat[mask] = 1.0 / dists[mask]
         
-        # Self-loops handled by normalization logic
         np.fill_diagonal(adj_mat, 0)
 
         if norm_lap_matr:
@@ -157,67 +147,51 @@ def read_file(_path, delim='\t'):
     return np.asarray(data)
 
 def seq_collate(data):
-    """
-    Pads sequences to enable [Batch, Max_Agents, ...] shape.
-    This allows batch_size > 1 in C-TAG.
-    """
     (obs_seq_list, pred_seq_list, obs_seq_rel_list, pred_seq_rel_list,
      non_linear_ped_list, loss_mask_list, v_obs_list, A_obs_list,
      v_pred_list, A_pred_list, seq_meta_list) = zip(*data)
 
-    # 1. Find Max Agents in this batch by checking dim 1 of v_obs
     max_agents = max([x.shape[1] for x in v_obs_list])
     
-    # Helper to pad (N, 2, T) tensors -> Pad N (dim 0)
     def pad_N(tensor, N_target):
         N, D, T = tensor.shape
         pad_amt = N_target - N
         if pad_amt == 0: return tensor
         return torch.cat([tensor, torch.zeros(pad_amt, D, T)], dim=0)
 
-    # Helper for Graphs: Pad V (T, N, 2)
     def pad_V(tensor, N_target):
         T, N, D = tensor.shape
         pad_amt = N_target - N
         if pad_amt == 0: return tensor
         return torch.cat([tensor, torch.zeros(T, pad_amt, D)], dim=1)
 
-    # Helper for Adjacency: Pad A (T, N, N)
     def pad_A(tensor, N_target):
         T, N, _ = tensor.shape
         pad = N_target - N
         if pad == 0: return tensor
-        # Pad columns
         tensor = torch.cat([tensor, torch.zeros(T, N, pad)], dim=2)
-        # Pad rows
         tensor = torch.cat([tensor, torch.zeros(T, pad, N + pad)], dim=1)
         return tensor
 
-    # Helper for Loss Mask (N, T)
     def pad_mask(tensor, N_target):
         N, T = tensor.shape
         pad = N_target - N
         if pad == 0: return tensor
         return torch.cat([tensor, torch.zeros(pad, T)], dim=0)
     
-    # Apply Padding
     obs_traj = torch.stack([pad_N(x, max_agents) for x in obs_seq_list])
     pred_traj = torch.stack([pad_N(x, max_agents) for x in pred_seq_list])
     obs_traj_rel = torch.stack([pad_N(x, max_agents) for x in obs_seq_rel_list])
     pred_traj_rel = torch.stack([pad_N(x, max_agents) for x in pred_seq_rel_list])
     
-    # Graph Tensors
     v_obs = torch.stack([pad_V(x, max_agents) for x in v_obs_list])
     v_pred = torch.stack([pad_V(x, max_agents) for x in v_pred_list])
     A_obs = torch.stack([pad_A(x, max_agents) for x in A_obs_list])
     A_pred = torch.stack([pad_A(x, max_agents) for x in A_pred_list])
     
     loss_mask = torch.stack([pad_mask(x, max_agents) for x in loss_mask_list])
-    
-    # Non-linear (Just cat, it's a flat list effectively)
     non_linear_ped = torch.cat(non_linear_ped_list, dim=0)
 
-    # Return structured batch
     return tuple([
         obs_traj, pred_traj, obs_traj_rel, pred_traj_rel, non_linear_ped,
         loss_mask, v_obs, A_obs, v_pred, A_pred, seq_meta_list
@@ -225,16 +199,11 @@ def seq_collate(data):
 
 
 class TrajectoryDataset(Dataset):
-    """
-    DataLoader for Trajectory Datasets (SDD, ETH/UCY).
-    Auto-detects mode:
-    - If .pkl files exist in data_dir -> Lazy Load Mode.
-    - If annotations/txt files exist -> Processing Mode (Generate Shards).
-    """
     def __init__(
         self, data_dir, obs_len=8, pred_len=8, skip=1, threshold=0.2,
         min_ped=1, delim='\t', norm_lap_matr=True, fill_missing=False, 
-        shuffle=False, n_splits=5, dataset_name='', processed_dir='./processed'):
+        shuffle=False, n_splits=5, dataset_name='', processed_dir='./processed',
+        min_displacement=30.0): # ADDED THRESHOLD HERE
         
         super(TrajectoryDataset, self).__init__()
 
@@ -253,21 +222,18 @@ class TrajectoryDataset(Dataset):
         self.processed_dir = processed_dir
         self.min_ped = min_ped
         self.threshold = threshold
+        self.min_displacement = min_displacement # STORED FOR USE
 
-        # AUTO-DETECT MODE
         pkl_files = glob.glob(os.path.join(self.data_dir, "**", "*.pkl"), recursive=True)
         
         if len(pkl_files) > 0:
-            # Mode: Lazy Loading (Files already exist)
             self._init_lazy_loading()
         else:
-            # Mode: Generate Shards (Raw data provided)
             print(f"No .pkl files found in {data_dir}. Scanning for raw data to process...")
             self._process_raw_data()
             self.num_seq = 0
 
     def _process_raw_data(self):
-        """Processes raw text files and saves them as sharded .pkl files."""
         if self.dataset_name.lower() in ['eth','hotel','univ','zara1','zara2']:
             self.delim = '\t'
         elif 'sdd' in self.dataset_name.lower():
@@ -285,15 +251,12 @@ class TrajectoryDataset(Dataset):
 
             for scene_name in scenes:
                 current_scene_path = os.path.join(self.data_dir, 'annotations', scene_name)
-                # Filter for proper video directories and sort to ensure deterministic splits
                 videos = os.listdir(current_scene_path)
                 videos = [v for v in videos if os.path.isdir(os.path.join(current_scene_path, v))]
                 videos.sort()
                 
                 num_videos = len(videos)
                 
-                # Intra-Scene Split: 70% Train, 15% Val, 15% Test
-                # Prioritize having at least 1 video in Val and Test if we have enough videos (>=3)
                 if num_videos >= 3:
                     n_val = max(1, int(num_videos * 0.15))
                     n_test = max(1, int(num_videos * 0.15))
@@ -316,7 +279,6 @@ class TrajectoryDataset(Dataset):
 
                 for s_name in splits:
                     videos_in_split = splits[s_name]
-                    # New dir structure: processed/split/scene_name/
                     split_out_dir = os.path.join(self.processed_dir, s_name, scene_name)
                     os.makedirs(split_out_dir, exist_ok=True)
 
@@ -324,13 +286,11 @@ class TrajectoryDataset(Dataset):
                         path = os.path.join(current_scene_path, v, 'annotations.txt')
                         if not os.path.exists(path): continue
                         
-                        # Match map_utils.py naming convention
                         meta_id = f"{scene_name}_{v}_map.pt" 
                         save_name = f"{scene_name}_{v}.pkl"
                         save_path = os.path.join(split_out_dir, save_name)
 
                         img_path = os.path.join(current_scene_path, v, 'reference.jpg')
-                        # Check if reference.jpg exists, otherwise find any jpg
                         if not os.path.exists(img_path):
                             jpgs = glob.glob(os.path.join(current_scene_path, v, "*.jpg"))
                             if len(jpgs) > 0: img_path = jpgs[0]
@@ -339,14 +299,10 @@ class TrajectoryDataset(Dataset):
                         self._process_single_video(path, meta_id, save_path, img_path)
 
     def _process_single_video(self, file_path, meta_id, save_path, img_path):
-        """Helper to process one video and save to disk immediately."""
-        
-        # 1. Calculate Scale Factors
         if os.path.exists(img_path):
             with Image.open(img_path) as img:
                 orig_w, orig_h = img.size
         else:
-            # Fallback if no image (unsafe, but prevents crash)
             print(f"Warning: No image found for {meta_id}, assuming 1.0 scale")
             orig_w, orig_h = 512, 512
 
@@ -364,9 +320,8 @@ class TrajectoryDataset(Dataset):
             else:
                 data = raw_data[:, :4]
             
-            # --- APPLY SCALING HERE ---
-            data[:, 2] = data[:, 2] * scale_x # Scale X
-            data[:, 3] = data[:, 3] * scale_y # Scale Y
+            data[:, 2] = data[:, 2] * scale_x
+            data[:, 3] = data[:, 3] * scale_y
         else:
             data = read_file(file_path, self.delim)
         
@@ -415,6 +370,39 @@ class TrajectoryDataset(Dataset):
                 if len(curr_obj_seq) != self.seq_len: continue
 
                 curr_obj_seq = np.transpose(curr_obj_seq[:, 2:4]) 
+                
+                # --- STATIONARY AGENT FILTER ---
+                # Calculate maximum distance traveled from their starting point
+                start_pos = curr_obj_seq[:, 0:1] # Shape (2, 1)
+                dists_from_start = np.linalg.norm(curr_obj_seq - start_pos, axis=0)
+                max_displacement = np.max(dists_from_start)
+                
+                # REVISED: Reduced from 30 to 15
+                if max_displacement < 15.0:
+                    continue # Skip this agent, they barely moved
+                # -------------------------------
+
+                # --- LINEAR AGENT FILTER ---
+                # Fit a 1st-degree polynomial (straight line) to the entire trajectory
+                t_steps = np.arange(self.seq_len)
+                
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter('ignore', np.RankWarning)
+                    res_x = np.polyfit(t_steps, curr_obj_seq[0, :], 1, full=True)[1]
+                    res_y = np.polyfit(t_steps, curr_obj_seq[1, :], 1, full=True)[1]
+                
+                err_x = res_x[0] if len(res_x) > 0 else 0.0
+                err_y = res_y[0] if len(res_y) > 0 else 0.0
+                total_linear_error = err_x + err_y
+                
+                # REVISED: Reduced from 20 to 5
+                # Only drop agents with LESS than 5 pixel deviation from a perfect line
+                if total_linear_error < 5.0:  
+                    continue # Skip this agent, they are walking in a perfect straight line
+                # ---------------------------------
+                
+               
                 rel_curr_obj_seq = np.zeros(curr_obj_seq.shape)
                 rel_curr_obj_seq[:, 1:] = curr_obj_seq[:, 1:] - curr_obj_seq[:, :-1]
                 
@@ -465,7 +453,6 @@ class TrajectoryDataset(Dataset):
             print(f"Saved {save_path} with {len(seq_list)} sequences.")
 
     def _init_lazy_loading(self):
-        """Scans processed directory and builds index."""
         search_path = os.path.join(self.data_dir, "**", "*.pkl")
         self.shard_paths = sorted(glob.glob(search_path, recursive=True))
         
