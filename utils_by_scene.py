@@ -386,11 +386,8 @@ class TrajectoryDataset(Dataset):
                 # Fit a 1st-degree polynomial (straight line) to the entire trajectory
                 t_steps = np.arange(self.seq_len)
                 
-                import warnings
-                with warnings.catch_warnings():
-                    warnings.simplefilter('ignore', np.RankWarning)
-                    res_x = np.polyfit(t_steps, curr_obj_seq[0, :], 1, full=True)[1]
-                    res_y = np.polyfit(t_steps, curr_obj_seq[1, :], 1, full=True)[1]
+                res_x = np.polyfit(t_steps, curr_obj_seq[0, :], 1, full=True)[1]
+                res_y = np.polyfit(t_steps, curr_obj_seq[1, :], 1, full=True)[1]
                 
                 err_x = res_x[0] if len(res_x) > 0 else 0.0
                 err_y = res_y[0] if len(res_y) > 0 else 0.0

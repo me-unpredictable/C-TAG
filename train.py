@@ -22,17 +22,21 @@ from metrics import *#ade_loss, fde_loss, bivariate_loss
 # [FIX] Define masked_mse_loss locally if import fails or for clarity
 def masked_mse_loss(V_pred, V_trgt, mask=None):
     """
-    Masked MSE Loss for warm-up.
+    Replaced with Smooth L1 (Huber) Loss for warm-up.
+    This is much more forgiving to large deviations (sharp turns).
     V_pred: [Batch, Time, Nodes, 5] (mu_x, mu_y, ...)
     V_trgt: [Batch, Time, Nodes, 2] (gt_x, gt_y)
     """
-    mu_x = V_pred[..., 0]
-    mu_y = V_pred[..., 1]
+    # Extract coordinates
+    mu = V_pred[..., :2]    # Shape: [Batch, Time, Nodes, 2]
+    target = V_trgt[..., :2] # Shape: [Batch, Time, Nodes, 2]
     
-    x = V_trgt[..., 0]
-    y = V_trgt[..., 1]
+    # Calculate Smooth L1 Loss (beta=1.0 is default PyTorch behavior)
+    # Reduces explosion of gradients on sharp curve misses
+    loss = torch.nn.functional.smooth_l1_loss(mu, target, reduction='none')
     
-    loss = (x - mu_x)**2 + (y - mu_y)**2
+    # Sum the loss over the X and Y coordinates
+    loss = torch.sum(loss, dim=-1)
     
     if mask is not None:
         loss = loss.masked_fill(~mask.bool(), 0.0)
@@ -40,6 +44,7 @@ def masked_mse_loss(V_pred, V_trgt, mask=None):
         if num_valid > 0:
             return torch.sum(loss) / num_valid
         return torch.tensor(0.0, device=loss.device)
+    
     return torch.mean(loss)
 
 def graph_loss(V_pred, V_target, mask=None, use_mse=False):
