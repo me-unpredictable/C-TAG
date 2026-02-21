@@ -254,7 +254,7 @@ class VSIE(nn.Module):
              
         return x + pos_enc
 
-    def forward(self, x, metadata):
+    def forward(self, x, abs_coords, metadata):
         # Input x is [Batch, Channel, Time, Nodes]
         x_input_coords = x.clone() 
         x_original = x.shape 
@@ -273,14 +273,15 @@ class VSIE(nn.Module):
         # --- C-TAG FUSION LOGIC ---
         if metadata is not None:
             batch_size = x_original[0]
-            
             if metadata.size(0) != batch_size:
                 visual_map = metadata.expand(batch_size, -1, -1, -1)
             else:
                 visual_map = metadata
                 
-            compressed_map = self.compressor(visual_map) # Output is now 256 channels
-            local_context = self.extract_local_context(compressed_map, x_input_coords)
+            compressed_map = self.compressor(visual_map) 
+            
+            # FIXED: Use abs_coords to sample the map, NOT relative x!
+            local_context = self.extract_local_context(compressed_map, abs_coords)
             
             # 3. DYNAMIC RESHAPE (Critical Fix)
             # Use -1 so it automatically adapts to 256 (or any other size)
@@ -411,7 +412,8 @@ class CTAG(nn.Module):
             
         
         
-    def forward(self,v,a,metadata=None):
+    def forward(self, v, a, abs_coords, metadata=None):
+        # print("CTAG Forward Pass - Metadata Received:", metadata is not None)
         assert metadata is not None, "Metadata is required for CTAG model"
 
         # Handle Batch Processing of Metadata
@@ -446,7 +448,7 @@ class CTAG(nn.Module):
         map_tensor = torch.stack(maps_list, dim=0)
 
         # Pass to VSIE (Compressor inside VSIE will attach grad)
-        v = self.vsie(v, map_tensor) 
+        v = self.vsie(v, abs_coords, map_tensor) 
         # v = self.vsie(v, None) # run this to check if map has a bug
         for k in range(self.n_gcnn):
             v, a = self.st_gcns[k](v, a)

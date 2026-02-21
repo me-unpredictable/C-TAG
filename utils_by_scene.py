@@ -398,7 +398,31 @@ class TrajectoryDataset(Dataset):
                 if total_linear_error < 5.0:  
                     continue # Skip this agent, they are walking in a perfect straight line
                 # ---------------------------------
+                 # --- PHYSICS FILTER (Tracking Artifacts) ---
+                # Calculate step-by-step velocity vectors
+                vel_vectors = curr_obj_seq[:, 1:] - curr_obj_seq[:, :-1] # Shape: (2, seq_len-1)
                 
+                v1 = vel_vectors[:, :-1]
+                v2 = vel_vectors[:, 1:]
+                
+                # Calculate dot product and magnitudes
+                dot_products = np.sum(v1 * v2, axis=0)
+                mag1 = np.linalg.norm(v1, axis=0)
+                mag2 = np.linalg.norm(v2, axis=0)
+                
+                # Avoid division by zero (ignore frames where agent is temporarily stopped)
+                valid_mask = (mag1 > 1e-4) & (mag2 > 1e-4)
+                
+                if np.any(valid_mask):
+                    cos_angles = dot_products[valid_mask] / (mag1[valid_mask] * mag2[valid_mask])
+                    # Clip to [-1, 1] to avoid arccos nan due to float precision
+                    cos_angles = np.clip(cos_angles, -1.0, 1.0)
+                    angles_deg = np.degrees(np.arccos(cos_angles))
+                    
+                    # If an agent instantly turns more than 120 degrees, it's an ID swap
+                    if np.max(angles_deg) > 120.0:
+                        continue # Skip this agent
+                # -------------------------------------------
                
                 rel_curr_obj_seq = np.zeros(curr_obj_seq.shape)
                 rel_curr_obj_seq[:, 1:] = curr_obj_seq[:, 1:] - curr_obj_seq[:, :-1]

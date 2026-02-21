@@ -83,10 +83,13 @@ def evaluate(model, loader, args, num_samples=20):
             
             # Prepare inputs
             V_obs_tmp = V_obs.permute(0, 3, 1, 2) 
-            
+            # NEW: Prepare Absolute Coordinates
+            abs_coords = obs_traj.permute(0, 2, 3, 1).contiguous()
             # Forward pass
             model_metadata = [m[0] for m in batch_metadata]
-            V_pred, _ = model(V_obs_tmp, A_obs, model_metadata)
+            # NEW: Pass abs_coords to the model
+            V_pred, _ = model(V_obs_tmp, A_obs, abs_coords, model_metadata)
+            
             V_pred = V_pred.permute(0, 2, 3, 1) # [Batch, Time, Nodes, 5]
             
             # ------------------------------------------------------------------

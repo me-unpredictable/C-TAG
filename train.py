@@ -124,19 +124,30 @@ def train(epoch, model, optimizer, loader_train, metrics):
 
         # 3. Forward
         V_obs_tmp = V_obs.permute(0, 3, 1, 2)
-        
+        # Prepare Absolute Coordinates for VSIE Map Sampling
+        # obs_traj is [Batch, Nodes, 2, Time] -> Convert to [Batch, 2, Time, Nodes]
+        abs_coords = obs_traj.permute(0, 2, 3, 1).contiguous()
         # Extract map filenames from metadata tuples
         model_metadata = [m[0] for m in batch_metadata_list]
         
-        V_pred, _ = model(V_obs_tmp, A_obs, model_metadata) 
-        V_pred = V_pred.permute(0, 2, 3, 1)
+        V_pred, _ = model(V_obs_tmp, A_obs, abs_coords, model_metadata) 
+        V_pred = V_pred.permute(0, 2, 3, 1) # [Batch, Time, Nodes, 5]
         
         # 4. Loss
+        # --- INTEGRATE TO ABSOLUTE FOR LOSS ---
+        V_pred_rel = V_pred[..., :2]
+        V_pred_cumsum = torch.cumsum(V_pred_rel, dim=1)
+        last_obs = obs_traj[:, :, :, -1].unsqueeze(1) # [Batch, 1, Nodes, 2]
+        V_pred_abs_mu = V_pred_cumsum + last_obs
+        # Reattach the sigmas and correlation
+        V_pred_abs = torch.cat([V_pred_abs_mu, V_pred[..., 2:]], dim=-1)
+        # Target must also be absolute!
+        V_tr_abs = pred_traj_gt.permute(0, 3, 1, 2)
         mask_perm = loss_mask.permute(0, 2, 1)
         mask_perm = mask_perm[:, -args.pred_seq_len:, :]
         
-        V_tr_perm = V_tr 
-        loss = graph_loss(V_pred, V_tr_perm, mask_perm, use_mse=use_mse)
+        # Calculate loss on Absolute Paths
+        loss = graph_loss(V_pred_abs, V_tr_abs, mask_perm, use_mse=use_mse)
         
         # Check for NaN
         if torch.isnan(loss) or torch.isinf(loss) or (loss.item() == 0 and epoch > 0):
@@ -173,7 +184,12 @@ def calculate_ade_fde(model, loader_val, metrics):
              V_obs_tmp = V_obs.permute(0, 3, 1, 2)
              model_metadata = [m[0] for m in batch_metadata_list] 
              
-             V_pred, _ = model(V_obs_tmp, A_obs, model_metadata)
+             # NEW: Prepare Absolute Coordinates
+             abs_coords = obs_traj.permute(0, 2, 3, 1).contiguous()
+             
+             # NEW: Pass abs_coords to the model
+             V_pred, _ = model(V_obs_tmp, A_obs, abs_coords, model_metadata)
+             
              V_pred = V_pred.permute(0, 2, 3, 1) # [Batch, Time, Nodes, 5]
 
              # --- INTEGRATION LOGIC (Make Absolute) ---
@@ -257,18 +273,28 @@ def vald(epoch, model, loader_val, metrics, constant_metrics):
             obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr = batch
 
             V_obs_tmp = V_obs.permute(0, 3, 1, 2)
-            
+            # Prepare Absolute Coordinates for VSIE
+            abs_coords = obs_traj.permute(0, 2, 3, 1).contiguous()
             # Extract map filenames
             model_metadata = [m[0] for m in batch_metadata_list]
-            
-            V_pred, _ = model(V_obs_tmp, A_obs, model_metadata)
+            # Pass abs_coords to the model
+            V_pred, _ = model(V_obs_tmp, A_obs, abs_coords, model_metadata)
             V_pred = V_pred.permute(0, 2, 3, 1)
+            # Integrate to Absolute for Validation Loss
+            V_pred_rel = V_pred[..., :2]
+            V_pred_cumsum = torch.cumsum(V_pred_rel, dim=1)
+            last_obs = obs_traj[:, :, :, -1].unsqueeze(1) 
+            V_pred_abs_mu = V_pred_cumsum + last_obs
+            
+            # Reattach sigmas and correlation
+            V_pred_abs = torch.cat([V_pred_abs_mu, V_pred[..., 2:]], dim=-1)
+            V_tr_abs = pred_traj_gt.permute(0, 3, 1, 2)
             
             mask_perm = loss_mask.permute(0, 2, 1)
             mask_perm = mask_perm[:, -args.pred_seq_len:, :]
             
-            V_tr_perm = V_tr
-            loss = graph_loss(V_pred, V_tr_perm, mask_perm, use_mse=use_mse)
+            # Calculate Loss
+            loss = graph_loss(V_pred_abs, V_tr_abs, mask_perm, use_mse=use_mse)
 
             loss_batch += loss.item()
             pbar.set_postfix({'Loss': loss_batch / (cnt + 1)})

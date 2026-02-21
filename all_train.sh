@@ -1,7 +1,7 @@
 # this script is to run all training experiments in terminal one by one
 
 # th 0.2 gcnn 1 tcnn 3 quad,nexus,little,hyang,gates,deathCircle,coupa,bookstore 
-#python train.py --dataset SDD --dataset_path ../datasets/SDD/archive --tag CTAG.g1.t3.th.0.2_quad --thres 0.2 --n_gcnn 1 --n_tcnn 3 --scene_name quad --num_epochs 250  --lr 0.01
+python train.py --dataset SDD --dataset_path ../datasets/SDD/archive --tag CTAG.g1.t3.th.0.2_quad --thres 0.2 --n_gcnn 1 --n_tcnn 3 --scene_name quad --num_epochs 250  --lr 0.01
 #python train.py --dataset SDD --dataset_path ../datasets/SDD/archive --tag CTAG.g1.t3.th.0.2_nexus --thres 0.2 --n_gcnn 1 --n_tcnn 3 --scene_name nexus --num_epochs 250 --lr 0.01
 #python train.py --dataset SDD --dataset_path ../datasets/SDD/archive --tag CTAG.g1.t3.th.0.2_little --thres 0.2 --n_gcnn 1 --n_tcnn 3 --scene_name little --num_epochs 250  --lr 0.01
 #python train.py --dataset SDD --dataset_path ../datasets/SDD/archive --tag CTAG.g1.t3.th.0.2_hyang --thres 0.2 --n_gcnn 1 --n_tcnn 3 --scene_name hyang --num_epochs 250  --lr 0.01
@@ -23,7 +23,7 @@ python train.py --dataset SDD --dataset_path ../datasets/SDD/archive --tag CTAG.
 
 
 # th 0.6 gcnn 1 tcnn 3 quad,nexus,little,hyang,gates,deathCircle,coupa,bookstore 
-#python train.py --dataset SDD --dataset_path ../datasets/SDD/archive --tag CTAG.g1.t3.th.0.6_quad --thres 0.6 --n_gcnn 1 --n_tcnn 3 --scene_name quad --num_epochs 250  --lr 0.01
+python train.py --dataset SDD --dataset_path ../datasets/SDD/archive --tag CTAG.g1.t3.th.0.6_quad --thres 0.6 --n_gcnn 1 --n_tcnn 3 --scene_name quad --num_epochs 250  --lr 0.01
 #python train.py --dataset SDD --dataset_path ../datasets/SDD/archive --tag CTAG.g1.t3.th.0.6_nexus --thres 0.6 --n_gcnn 1 --n_tcnn 3 --scene_name nexus --num_epochs 250 --lr 0.01
 #python train.py --dataset SDD --dataset_path ../datasets/SDD/archive --tag CTAG.g1.t3.th.0.6_little --thres 0.6 --n_gcnn 1 --n_tcnn 3 --scene_name little --num_epochs 250  --lr 0.01
 #python train.py --dataset SDD --dataset_path ../datasets/SDD/archive --tag CTAG.g1.t3.th.0.6_hyang --thres 0.6 --n_gcnn 1 --n_tcnn 3 --scene_name hyang --num_epochs 250  --lr 0.01

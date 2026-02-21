@@ -95,6 +95,7 @@ def evaluate(model, loader, args, num_samples=20):
             
             batch_size = V_pred.shape[0]
             V_pred_np = V_pred_abs.cpu().numpy()
+            V_pred_params_np = V_pred.cpu().numpy()
             V_tr_np = V_tr_abs.cpu().numpy()
             obs_traj_np = obs_traj_abs.cpu().numpy()
             loss_mask_np = loss_mask.cpu().numpy()
@@ -131,16 +132,39 @@ def evaluate(model, loader, args, num_samples=20):
                     ped_pred = p_i[:, ped_idx, :]
                     ped_gt = t_i[:, ped_idx, :]
                     ped_obs = o_i[:, ped_idx, :]
-                    
+
                     ped_ade = np.mean(np.linalg.norm(ped_pred - ped_gt, axis=-1))
-                    
+
                     # Track physical movement distance to filter out stationary people
                     displacement = np.linalg.norm(ped_gt[-1] - ped_obs[0])
-                    
+
+                    params = V_pred_params_np[i, :, ped_idx, :]
+                    mu = params[:, :2]
+                    log_sx = np.clip(params[:, 2], -20.0, 6.0)
+                    log_sy = np.clip(params[:, 3], -20.0, 6.0)
+                    sx = np.exp(log_sx)
+                    sy = np.exp(log_sy)
+                    corr = np.tanh(params[:, 4])
+                    corr = np.clip(corr, -0.999, 0.999)
+
+                    sample_rel = np.zeros((num_samples, mu.shape[0], 2), dtype=mu.dtype)
+                    for t in range(mu.shape[0]):
+                        cov = np.array([
+                            [sx[t] * sx[t], corr[t] * sx[t] * sy[t]],
+                            [corr[t] * sx[t] * sy[t], sy[t] * sy[t]]
+                        ])
+                        sample_rel[:, t, :] = np.random.multivariate_normal(mu[t], cov, size=num_samples)
+
+                    last_obs = obs_traj_np[i, -1, ped_idx, :2]
+                    sample_abs = np.cumsum(sample_rel, axis=1) + last_obs[None, None, :]
+                    sample_abs[..., 0] *= unscale_x
+                    sample_abs[..., 1] *= unscale_y
+
                     ped_trajectories.append({
                         'ade': ped_ade,
                         'obs': ped_obs,
                         'pred': ped_pred,
+                        'pred_samples': sample_abs,
                         'gt': ped_gt,
                         'displacement': displacement,
                         'meta_id': meta_id
@@ -185,15 +209,23 @@ def plot_top_5_trajectories(ped_trajectories, data_dir):
                 map_img_path = None
         
         obs = traj['obs']
-        pred = traj['pred']
         gt = traj['gt']
+        pred_samples = traj.get('pred_samples')
+        if pred_samples is None:
+            pred_samples = np.expand_dims(traj['pred'], axis=0)
+        sample_colors = plt.get_cmap('tab20', pred_samples.shape[0])
         
         plt.plot(obs[:, 0], obs[:, 1], color='blue', marker='o', linestyle='-', linewidth=2, label='Observed History', markersize=4)
         plt.plot(gt[:, 0], gt[:, 1], color='green', marker='s', linestyle='-', linewidth=2, label='Ground Truth Future', markersize=4)
-        plt.plot(pred[:, 0], pred[:, 1], color='red', marker='*', linestyle='--', linewidth=2, label='Predicted Future', markersize=5)
+        for s_idx in range(pred_samples.shape[0]):
+            color = sample_colors(s_idx)
+            label = 'Predicted Samples' if s_idx == 0 else None
+            plt.plot(pred_samples[s_idx, :, 0], pred_samples[s_idx, :, 1], color=color, linestyle='--', linewidth=1.5, label=label, alpha=0.85)
         
         plt.plot([obs[-1, 0], gt[0, 0]], [obs[-1, 1], gt[0, 1]], color='green', linestyle='-', linewidth=2)
-        plt.plot([obs[-1, 0], pred[0, 0]], [obs[-1, 1], pred[0, 1]], color='red', linestyle='--', linewidth=2)
+        for s_idx in range(pred_samples.shape[0]):
+            color = sample_colors(s_idx)
+            plt.plot([obs[-1, 0], pred_samples[s_idx, 0, 0]], [obs[-1, 1], pred_samples[s_idx, 0, 1]], color=color, linestyle='--', linewidth=1)
         
         if map_img_path:
             img = mpimg.imread(map_img_path)
@@ -204,8 +236,8 @@ def plot_top_5_trajectories(ped_trajectories, data_dir):
         else:
             plt.grid(True, linestyle='--', alpha=0.6)
             # Determine the center of the trajectory and create a fixed 150-pixel viewing window
-            all_x = np.concatenate([obs[:, 0], gt[:, 0], pred[:, 0]])
-            all_y = np.concatenate([obs[:, 1], gt[:, 1], pred[:, 1]])
+            all_x = np.concatenate([obs[:, 0], gt[:, 0], pred_samples.reshape(-1, 2)[:, 0]])
+            all_y = np.concatenate([obs[:, 1], gt[:, 1], pred_samples.reshape(-1, 2)[:, 1]])
             cx, cy = np.mean(all_x), np.mean(all_y)
             window = 100 
             plt.xlim(cx - window, cx + window)
@@ -248,15 +280,23 @@ def plot_bottom_5_trajectories(ped_trajectories, data_dir):
                 map_img_path = None
         
         obs = traj['obs']
-        pred = traj['pred']
         gt = traj['gt']
+        pred_samples = traj.get('pred_samples')
+        if pred_samples is None:
+            pred_samples = np.expand_dims(traj['pred'], axis=0)
+        sample_colors = plt.get_cmap('tab20', pred_samples.shape[0])
         
         plt.plot(obs[:, 0], obs[:, 1], color='blue', marker='o', linestyle='-', linewidth=2, label='Observed History', markersize=4)
         plt.plot(gt[:, 0], gt[:, 1], color='green', marker='s', linestyle='-', linewidth=2, label='Ground Truth Future', markersize=4)
-        plt.plot(pred[:, 0], pred[:, 1], color='red', marker='*', linestyle='--', linewidth=2, label='Predicted Future', markersize=5)
+        for s_idx in range(pred_samples.shape[0]):
+            color = sample_colors(s_idx)
+            label = 'Predicted Samples' if s_idx == 0 else None
+            plt.plot(pred_samples[s_idx, :, 0], pred_samples[s_idx, :, 1], color=color, linestyle='--', linewidth=1.5, label=label, alpha=0.85)
         
         plt.plot([obs[-1, 0], gt[0, 0]], [obs[-1, 1], gt[0, 1]], color='green', linestyle='-', linewidth=2)
-        plt.plot([obs[-1, 0], pred[0, 0]], [obs[-1, 1], pred[0, 1]], color='red', linestyle='--', linewidth=2)
+        for s_idx in range(pred_samples.shape[0]):
+            color = sample_colors(s_idx)
+            plt.plot([obs[-1, 0], pred_samples[s_idx, 0, 0]], [obs[-1, 1], pred_samples[s_idx, 0, 1]], color=color, linestyle='--', linewidth=1)
         
         if map_img_path:
             img = mpimg.imread(map_img_path)
@@ -267,8 +307,8 @@ def plot_bottom_5_trajectories(ped_trajectories, data_dir):
         else:
             plt.grid(True, linestyle='--', alpha=0.6)
             # Determine the center of the trajectory and create a fixed 150-pixel viewing window
-            all_x = np.concatenate([obs[:, 0], gt[:, 0], pred[:, 0]])
-            all_y = np.concatenate([obs[:, 1], gt[:, 1], pred[:, 1]])
+            all_x = np.concatenate([obs[:, 0], gt[:, 0], pred_samples.reshape(-1, 2)[:, 0]])
+            all_y = np.concatenate([obs[:, 1], gt[:, 1], pred_samples.reshape(-1, 2)[:, 1]])
             cx, cy = np.mean(all_x), np.mean(all_y)
             window = 100 
             plt.xlim(cx - window, cx + window)
