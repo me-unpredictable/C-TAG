@@ -423,6 +423,19 @@ class TrajectoryDataset(Dataset):
                     if np.max(angles_deg) > 120.0:
                         continue # Skip this agent
                 # -------------------------------------------
+
+                # --- BOUNDARY FILTER (Edge Noise) ---
+                # Remove agents that get too close to the image edges (e.g., 30 original pixels)
+                margin_x = 30.0 * scale_x
+                margin_y = 30.0 * scale_y
+                
+                min_x, max_x = np.min(curr_obj_seq[0, :]), np.max(curr_obj_seq[0, :])
+                min_y, max_y = np.min(curr_obj_seq[1, :]), np.max(curr_obj_seq[1, :])
+                
+                if (min_x < margin_x) or (max_x > 512.0 - margin_x) or \
+                   (min_y < margin_y) or (max_y > 512.0 - margin_y):
+                    continue # Skip this agent, they are touching the edge noise zone
+                # ------------------------------------
                
                 rel_curr_obj_seq = np.zeros(curr_obj_seq.shape)
                 rel_curr_obj_seq[:, 1:] = curr_obj_seq[:, 1:] - curr_obj_seq[:, :-1]

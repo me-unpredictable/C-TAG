@@ -155,7 +155,7 @@ def evaluate(model, loader, args, num_samples=20):
     
     return ped_trajectories
 
-def plot_top_5_trajectories(ped_trajectories, data_dir):
+def plot_top_5_trajectories(ped_trajectories, data_dir, no_map=False):
     # Filter out people who moved less than 15 pixels overall
     moving_trajectories = [t for t in ped_trajectories if t['displacement'] > 15.0]
     
@@ -195,7 +195,7 @@ def plot_top_5_trajectories(ped_trajectories, data_dir):
         plt.plot([obs[-1, 0], gt[0, 0]], [obs[-1, 1], gt[0, 1]], color='green', linestyle='-', linewidth=2)
         plt.plot([obs[-1, 0], pred[0, 0]], [obs[-1, 1], pred[0, 1]], color='red', linestyle='--', linewidth=2)
         
-        if map_img_path:
+        if map_img_path and not no_map:
             img = mpimg.imread(map_img_path)
             # Load Map and Align with standard image coordinates (Y=0 at Top)
             plt.imshow(img, extent=[0, img.shape[1], img.shape[0], 0])
@@ -218,7 +218,7 @@ def plot_top_5_trajectories(ped_trajectories, data_dir):
         
         plt.show()
 
-def plot_bottom_5_trajectories(ped_trajectories, data_dir):
+def plot_bottom_5_trajectories(ped_trajectories, data_dir, no_map=False):
     # Filter out people who moved less than 15 pixels overall
     moving_trajectories = [t for t in ped_trajectories if t['displacement'] > 15.0]
     
@@ -258,7 +258,7 @@ def plot_bottom_5_trajectories(ped_trajectories, data_dir):
         plt.plot([obs[-1, 0], gt[0, 0]], [obs[-1, 1], gt[0, 1]], color='green', linestyle='-', linewidth=2)
         plt.plot([obs[-1, 0], pred[0, 0]], [obs[-1, 1], pred[0, 1]], color='red', linestyle='--', linewidth=2)
         
-        if map_img_path:
+        if map_img_path and not no_map:
             img = mpimg.imread(map_img_path)
             # Load Map and Align with standard image coordinates (Y=0 at Top)
             plt.imshow(img, extent=[0, img.shape[1], img.shape[0], 0])
@@ -282,6 +282,10 @@ def plot_bottom_5_trajectories(ped_trajectories, data_dir):
         plt.show()
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--no_map', action='store_true', help='Disable map and show only close up of trajectories')
+    cmd_args = parser.parse_args()
+
     model_path, args_path = get_model_path()
     
     with open(args_path, 'rb') as f:
@@ -344,7 +348,7 @@ def main():
     ped_trajectories = evaluate(model, loader_test, args, num_samples=20)
     
     if ped_trajectories:
-        plot_top_5_trajectories(ped_trajectories, test_data_dir)
-        plot_bottom_5_trajectories(ped_trajectories, test_data_dir)
+        plot_top_5_trajectories(ped_trajectories, test_data_dir, no_map=cmd_args.no_map)
+        plot_bottom_5_trajectories(ped_trajectories, test_data_dir, no_map=cmd_args.no_map)
 if __name__ == '__main__':
     main()
