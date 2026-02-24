@@ -188,11 +188,14 @@ class VSIE(nn.Module):
         batch_size, channels, h_dim, w_dim = feature_map.shape
         _, _, time_steps, num_nodes = agent_coords.shape
         
-        # Permute to [Batch, Time, Nodes, 2]
+        # Permute to [Batch, Time, Nodes, Features]
         coords = agent_coords.permute(0, 2, 3, 1)
         
+        # Extract only x and y coordinates (first 2 features)
+        coords_xy = coords[..., :2]
+        
         # Flatten for grid_sample: [Batch, Time*Nodes, 1, 2]
-        flat_coords = coords.reshape(batch_size, -1, 1, 2)
+        flat_coords = coords_xy.reshape(batch_size, -1, 1, 2)
         
         # Normalize to [-1, 1] for grid_sample
         norm_coords = torch.zeros_like(flat_coords)
@@ -283,7 +286,7 @@ class VSIE(nn.Module):
         return out
 
 class CTAG(nn.Module):
-    def __init__(self,threshold,n_gcnn =1,n_tcnn=1,input_feat=2,output_feat=5,
+    def __init__(self,threshold,n_gcnn =1,n_tcnn=1,input_feat=4,output_feat=5,
                  seq_len=8,pred_seq_len=12,kernel_size=3):
         super(CTAG,self).__init__()
         self.vsie = VSIE(input_feat,threshold) 

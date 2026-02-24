@@ -66,7 +66,7 @@ def graph_loss(V_pred, V_target, mask=None, use_mse=False):
 parser = argparse.ArgumentParser()
 
 # Model specific parameters
-parser.add_argument('--input_size', type=int, default=2)
+parser.add_argument('--input_size', type=int, default=4) # [dx, dy, speed, heading angle]
 parser.add_argument('--output_size', type=int, default=5)
 parser.add_argument('--n_gcnn', type=int, default=2, help='Number of GCN layers')
 parser.add_argument('--n_tcnn', type=int, default=6, help='Number of CNN layers')
@@ -116,9 +116,25 @@ def train(epoch, model, optimizer, loader_train, metrics):
         batch_tensors = batch[:-1] 
         batch_metadata_list = batch[-1]
         
-        batch = [tensor.cuda() for tensor in batch_tensors]
+        # [FIX] Robust Unpacking for Theta
+        if len(batch_tensors) == 11:
+            obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr, theta = batch_tensors
+            theta = theta.cuda()
+        else:
+            obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr = batch_tensors
+            theta = None
         
-        obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr = batch
+        # Move to GPU
+        obs_traj = obs_traj.cuda()
+        pred_traj_gt = pred_traj_gt.cuda()
+        obs_traj_rel = obs_traj_rel.cuda()
+        pred_traj_gt_rel = pred_traj_gt_rel.cuda()
+        non_linear_ped = non_linear_ped.cuda()
+        loss_mask = loss_mask.cuda()
+        V_obs = V_obs.cuda()
+        A_obs = A_obs.cuda()
+        V_tr = V_tr.cuda()
+        A_tr = A_tr.cuda()
 
         optimizer.zero_grad() 
 
@@ -128,18 +144,42 @@ def train(epoch, model, optimizer, loader_train, metrics):
         # obs_traj is [Batch, Nodes, 2, Time] -> Convert to [Batch, 2, Time, Nodes]
         abs_coords = obs_traj.permute(0, 2, 3, 1).contiguous()
         # Extract map filenames from metadata tuples
-        model_metadata = [m[0] for m in batch_metadata_list]
+        
+        # [FIX] Safer metadata extraction
+        model_metadata = []
+        for m in batch_metadata_list:
+            if isinstance(m, (list, tuple)):
+                 model_metadata.append(m[0])
+            else:
+                 model_metadata = batch_metadata_list # Assume clean list if not tuple
+                 break
         
         V_pred, _ = model(V_obs_tmp, A_obs, abs_coords, model_metadata) 
         V_pred = V_pred.permute(0, 2, 3, 1) # [Batch, Time, Nodes, 5]
         
         # 4. Loss
         # --- INTEGRATE TO ABSOLUTE FOR LOSS ---
+        # V_pred outputs RELATIVE offsets in the CANONICAL frame
+        # We need to rotate these offsets BACK to the global frame before integrating
+        
         V_pred_rel = V_pred[..., :2]
-        V_pred_cumsum = torch.cumsum(V_pred_rel, dim=1)
+        
+        # [FIX] Inverse Rotation if theta exists
+        if theta is not None:
+             theta_exp = theta.unsqueeze(1).expand_as(V_pred_rel[..., 0])
+             cos_th = torch.cos(theta_exp)
+             sin_th = torch.sin(theta_exp)
+             dx, dy = V_pred_rel[..., 0], V_pred_rel[..., 1]
+             dx_g = dx * cos_th - dy * sin_th
+             dy_g = dx * sin_th + dy * cos_th
+             V_pred_rel_global = torch.stack([dx_g, dy_g], dim=-1)
+        else:
+             V_pred_rel_global = V_pred_rel
+        
+        V_pred_cumsum = torch.cumsum(V_pred_rel_global, dim=1)
         last_obs = obs_traj[:, :, :, -1].unsqueeze(1) # [Batch, 1, Nodes, 2]
         V_pred_abs_mu = V_pred_cumsum + last_obs
-        # Reattach the sigmas and correlation
+        # Reattach the sigmas and correlation (Unchanged by rotation)
         V_pred_abs = torch.cat([V_pred_abs_mu, V_pred[..., 2:]], dim=-1)
         # Target must also be absolute!
         V_tr_abs = pred_traj_gt.permute(0, 3, 1, 2)
@@ -148,6 +188,7 @@ def train(epoch, model, optimizer, loader_train, metrics):
         
         # Calculate loss on Absolute Paths
         loss = graph_loss(V_pred_abs, V_tr_abs, mask_perm, use_mse=use_mse)
+
         
         # Check for NaN
         if torch.isnan(loss) or torch.isinf(loss) or (loss.item() == 0 and epoch > 0):
@@ -175,11 +216,23 @@ def calculate_ade_fde(model, loader_val, metrics):
     with torch.no_grad():
         for batch in loader_val: 
              batch_tensors = batch[:-1]
+             # Unpack theta from the batch tensors (now the 11th tensor)
+             obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr, theta = batch_tensors
+             
              batch_metadata_list = batch[-1]
              
-             batch = [tensor.cuda() for tensor in batch_tensors]
-             # Note: We need obs_traj (for last pos) and pred_traj_gt (for absolute target)
-             obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr = batch
+             # Move tensors to GPU
+             obs_traj = obs_traj.cuda()
+             pred_traj_gt = pred_traj_gt.cuda()
+             obs_traj_rel = obs_traj_rel.cuda()
+             pred_traj_gt_rel = pred_traj_gt_rel.cuda()
+             non_linear_ped = non_linear_ped.cuda()
+             loss_mask = loss_mask.cuda()
+             V_obs = V_obs.cuda()
+             A_obs = A_obs.cuda()
+             V_tr = V_tr.cuda()
+             A_tr = A_tr.cuda()
+             theta = theta.cuda()
 
              V_obs_tmp = V_obs.permute(0, 3, 1, 2)
              model_metadata = [m[0] for m in batch_metadata_list] 
@@ -196,8 +249,30 @@ def calculate_ade_fde(model, loader_val, metrics):
              # 1. Get Relative predictions (dx, dy)
              V_pred_rel = V_pred[..., :2]
              
+             # Un-rotate the predictions before integration
+             # theta is [Batch, Max_Agents], expand to [Batch, Time, Max_Agents] for broadcasting
+             theta_exp = theta.unsqueeze(1).expand_as(V_pred_rel[..., 0])
+             
+             cos_th = torch.cos(theta_exp)
+             sin_th = torch.sin(theta_exp)
+             
+             # Rotated Back:
+             # x' = x cos(th) - y sin(th)  (To rotate back by +theta? No, we rotated by -theta to align)
+             # To reverse -theta rotation, we rotate by +theta. 
+             # x_global = x_local * cos(theta) - y_local * sin(theta) 
+             # y_global = x_local * sin(theta) + y_local * cos(theta)
+             
+             dx_local = V_pred_rel[..., 0]
+             dy_local = V_pred_rel[..., 1]
+             
+             dx_global = dx_local * cos_th - dy_local * sin_th
+             dy_global = dx_local * sin_th + dy_local * cos_th
+             
+             # Re-stack
+             V_pred_rel_global = torch.stack([dx_global, dy_global], dim=-1)
+             
              # 2. Integrate offsets
-             V_pred_cumsum = torch.cumsum(V_pred_rel, dim=1)
+             V_pred_cumsum = torch.cumsum(V_pred_rel_global, dim=1)
              
              # 3. Add Last Observed Position
              # obs_traj is [Batch, Nodes, 2, Time] -> Get last time step
@@ -270,7 +345,13 @@ def vald(epoch, model, loader_val, metrics, constant_metrics):
             batch_metadata_list = batch[-1]
             
             batch = [tensor.cuda() for tensor in batch_tensors]
-            obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr = batch
+            
+            # [FIX] Unpack theta (11th element), if present. Handle backward compatibility.
+            if len(batch) == 11:
+                obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr, theta = batch
+            else:
+                 obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr = batch
+                 theta = None
 
             V_obs_tmp = V_obs.permute(0, 3, 1, 2)
             # Prepare Absolute Coordinates for VSIE
@@ -282,6 +363,18 @@ def vald(epoch, model, loader_val, metrics, constant_metrics):
             V_pred = V_pred.permute(0, 2, 3, 1)
             # Integrate to Absolute for Validation Loss
             V_pred_rel = V_pred[..., :2]
+            
+            # --- INVERSE ROTATION ---
+            if theta is not None:
+                theta_exp = theta.unsqueeze(1).expand_as(V_pred_rel[..., 0])
+                cos_th = torch.cos(theta_exp)
+                sin_th = torch.sin(theta_exp)
+                dx, dy = V_pred_rel[..., 0], V_pred_rel[..., 1]
+                dx_g = dx * cos_th - dy * sin_th
+                dy_g = dx * sin_th + dy * cos_th
+                V_pred_rel = torch.stack([dx_g, dy_g], dim=-1)
+            # ------------------------
+            
             V_pred_cumsum = torch.cumsum(V_pred_rel, dim=1)
             last_obs = obs_traj[:, :, :, -1].unsqueeze(1) 
             V_pred_abs_mu = V_pred_cumsum + last_obs
@@ -446,6 +539,12 @@ if __name__ == '__main__':
     best_val_loss = float('inf')
     best_model_state = None
 
+    # Early Stopping Variables
+    early_stop_counter = 0
+    early_stop_patience = 20
+    early_stop_tolerance = 0.001  # Tolerance as discussed
+    min_lr_threshold = 1.1e-5     # Slightly above 1e-5 to safely catch it if float precision varies
+    
     print("Starting Training Loop...")
 
     for epoch in range(args.num_epochs): 
@@ -454,14 +553,44 @@ if __name__ == '__main__':
         if not args.skip_val:
             vald(epoch, model, loader_val, metrics, constant_metrics)
         
+        current_lr = optimizer.param_groups[0]['lr']
+        current_val_loss = metrics['val_loss'][-1] if len(metrics['val_loss']) > 0 else float('inf')
+
         # Scheduler
         if args.use_lrschd:
             if scheduler is not None:
-                current_train_loss = metrics['train_loss'][-1] if len(metrics['train_loss']) > 0 else float('inf')
-                scheduler.step(current_train_loss)
+                # Use Validation Loss as it's the standard for ReduceLROnPlateau
+                # and aligns with our Early Stopping metric
+                current_monitor_loss = metrics['val_loss'][-1] if len(metrics['val_loss']) > 0 else float('inf')
+                scheduler.step(current_monitor_loss)
+                
                 print(f"Learning Rate after Epoch {epoch}: {optimizer.param_groups[0]['lr']}")
                 if len(metrics['train_loss']) > 0 and np.isnan(metrics['train_loss'][-1]):
                     print("NaN loss detected.")
+
+        # --- Early Stopping Logic ---
+        # 1. Check if we are at the lowest LR
+        if optimizer.param_groups[0]['lr'] <= min_lr_threshold:
+             # Check improvement against the best observed loss so far
+             # constant_metrics['min_val_loss'] holds the absolute best validation loss seen
+             
+            print(f" [EarlyStopping] LR is at minimum ({optimizer.param_groups[0]['lr']:.6f})...")
+
+            # Check if current epoch's loss improved significantly over the 'best'
+            if metrics['val_loss'][-1] > (constant_metrics['min_val_loss'] - early_stop_tolerance):
+                 early_stop_counter += 1
+                 print(f" [EarlyStopping] No significant improvement (curr: {metrics['val_loss'][-1]:.4f} vs best: {constant_metrics['min_val_loss']:.4f}). Counter: {early_stop_counter}/{early_stop_patience}")
+            else:
+                 early_stop_counter = 0
+                 print(f" [EarlyStopping] Improvement detected! Counter reset.")
+
+            if early_stop_counter >= early_stop_patience:
+                 print("*"*50)
+                 print(f" [EarlyStopping] Triggered! LR is min and no improvement for {early_stop_patience} epochs.")
+                 print("*"*50)
+                 break
+        else:
+             early_stop_counter = 0
 
         # Console Log
         print(f'Epoch: {epoch} | Train Loss: {metrics["train_loss"][-1]:.4f} | Val Loss: {metrics["val_loss"][-1]:.4f}')

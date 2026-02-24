@@ -9,6 +9,7 @@ Description:
     - Correct Metadata Naming (Matches map_utils.py)
     - Lazy Loading (Handles large datasets like SDD)
     - Dynamic Filtering of Stationary Agents (min_displacement)
+    - Canonical Rotation (Agent-Centric Coordination)
 
 Author: me__unpredictable (vishal patel) https://vishalresearch.com
 """
@@ -45,12 +46,56 @@ def normalize_adj_dense(mx):
     r_mat_inv = np.diag(r_inv)
     mx = r_mat_inv.dot(mx).dot(r_mat_inv)
     return mx
-                
+
+def poly_fit(traj, pred_len, threshold):
+    """
+    Input:
+    - traj: Numpy array of shape (2, obs_len)
+    - pred_len: Length of prediction
+    - threshold: minimum error to be considered non linear
+    Output:
+    - int: 1 -> Non Linear, 0-> Linear
+    """
+    t = np.arange(traj.shape[1])
+    res_x = np.polyfit(t, traj[0, :], 2, full=True)[1]
+    res_y = np.polyfit(t, traj[1, :], 2, full=True)[1]
+    if len(res_x) == 0:
+        res_x = 0.0
+    else:
+        res_x = res_x[0]
+    if len(res_y) == 0:
+        res_y = 0.0
+    else:
+        res_y = res_y[0]
+    if res_x + res_y >= threshold:
+        return 1.0
+    else:
+        return 0.0
+
+def read_file(file_path, delim='\t'):
+    data = []
+    if delim == 'tab':
+        delim = '\t'
+    elif delim == 'space':
+        delim = ' '
+    with open(file_path, 'r') as f:
+        for line in f:
+            line = line.strip().split(delim)
+            # Filter out empty strings and non-numeric values (like "Biker" in SDD)
+            line_data = []
+            for i in line:
+                try:
+                    line_data.append(float(i))
+                except ValueError:
+                    pass
+            data.append(line_data)
+    return np.asarray(data)
+
 def seq_to_graph(seq_, seq_rel, norm_lap_matr=True):
     """
     Vectorized version of graph construction.
     seq_: [Num_Nodes, 2, Seq_Len]
-    seq_rel: [Num_Nodes, 2, Seq_Len]
+    seq_rel: [Num_Nodes, Num_Features, Seq_Len]
     """
     if torch.is_tensor(seq_):
         seq_np = seq_.detach().cpu().numpy()
@@ -65,8 +110,11 @@ def seq_to_graph(seq_, seq_rel, norm_lap_matr=True):
 
     num_nodes = seq_np.shape[0]
     seq_len = seq_np.shape[2]
+    
+    # Dynamically get the number of features 
+    num_features = seq_rel_np.shape[1]
 
-    V = np.zeros((seq_len, num_nodes, 2))
+    V = np.zeros((seq_len, num_nodes, num_features))
     A = np.zeros((seq_len, num_nodes, num_nodes))
 
     for s in range(seq_len):
@@ -90,120 +138,12 @@ def seq_to_graph(seq_, seq_rel, norm_lap_matr=True):
 
     return torch.from_numpy(V).type(torch.float), torch.from_numpy(A).type(torch.float)
 
-def poly_fit(traj, traj_len, threshold):
-    t = np.linspace(0, traj_len - 1, traj_len)
-    res_x = np.polyfit(t, traj[0, -traj_len:], 2, full=True)[1] 
-    res_y = np.polyfit(t, traj[1, -traj_len:], 2, full=True)[1] 
-    if res_x + res_y >= threshold: 
-        return 1.0
-    else:
-        return 0.0
-
-def read_file(_path, delim='\t'):
-    data = []
-    if delim == 'space':
-        delim = ' ' 
-    
-    class_map = {
-        '"Pedestrian"': 1, 'Pedestrian': 1,
-        '"Biker"': 2, 'Biker': 2,
-        '"Skater"': 3, 'Skater': 3,
-        '"Car"': 4, 'Car': 4,
-        '"Bus"': 5, 'Bus': 5,
-        '"Cart"': 6, 'Cart': 6
-    }
-
-    def parse_and_append(file_obj, delimiter, data_list):
-        for line in file_obj:
-            line = line.strip()
-            if not line: continue
-            raw_tokens = line.split(delimiter)
-            if delimiter == ' ':
-                raw_tokens = [x for x in raw_tokens if x]
-            parsed_line = []
-            for i in raw_tokens:
-                try:
-                    parsed_line.append(float(i))
-                except ValueError:
-                    if i in class_map:
-                        parsed_line.append(float(class_map[i]))
-                    else:
-                        parsed_line.append(0.0)
-            if len(parsed_line) > 0:
-                data_list.append(parsed_line)
-
-    try:
-        with open(_path, 'r', encoding='latin-1') as f:
-            parse_and_append(f, delim, data)
-        if len(data) > 0 and len(data[0]) < 2:
-            raise ValueError("Likely wrong delimiter")    
-    except:
-        data = []
-        if delim == '\t': delim = ' '
-        else: delim = '\t'
-        with open(_path, 'r', encoding='latin-1') as f:
-            parse_and_append(f, delim, data)
-            
-    return np.asarray(data)
-
-def seq_collate(data):
-    (obs_seq_list, pred_seq_list, obs_seq_rel_list, pred_seq_rel_list,
-     non_linear_ped_list, loss_mask_list, v_obs_list, A_obs_list,
-     v_pred_list, A_pred_list, seq_meta_list) = zip(*data)
-
-    max_agents = max([x.shape[1] for x in v_obs_list])
-    
-    def pad_N(tensor, N_target):
-        N, D, T = tensor.shape
-        pad_amt = N_target - N
-        if pad_amt == 0: return tensor
-        return torch.cat([tensor, torch.zeros(pad_amt, D, T)], dim=0)
-
-    def pad_V(tensor, N_target):
-        T, N, D = tensor.shape
-        pad_amt = N_target - N
-        if pad_amt == 0: return tensor
-        return torch.cat([tensor, torch.zeros(T, pad_amt, D)], dim=1)
-
-    def pad_A(tensor, N_target):
-        T, N, _ = tensor.shape
-        pad = N_target - N
-        if pad == 0: return tensor
-        tensor = torch.cat([tensor, torch.zeros(T, N, pad)], dim=2)
-        tensor = torch.cat([tensor, torch.zeros(T, pad, N + pad)], dim=1)
-        return tensor
-
-    def pad_mask(tensor, N_target):
-        N, T = tensor.shape
-        pad = N_target - N
-        if pad == 0: return tensor
-        return torch.cat([tensor, torch.zeros(pad, T)], dim=0)
-    
-    obs_traj = torch.stack([pad_N(x, max_agents) for x in obs_seq_list])
-    pred_traj = torch.stack([pad_N(x, max_agents) for x in pred_seq_list])
-    obs_traj_rel = torch.stack([pad_N(x, max_agents) for x in obs_seq_rel_list])
-    pred_traj_rel = torch.stack([pad_N(x, max_agents) for x in pred_seq_rel_list])
-    
-    v_obs = torch.stack([pad_V(x, max_agents) for x in v_obs_list])
-    v_pred = torch.stack([pad_V(x, max_agents) for x in v_pred_list])
-    A_obs = torch.stack([pad_A(x, max_agents) for x in A_obs_list])
-    A_pred = torch.stack([pad_A(x, max_agents) for x in A_pred_list])
-    
-    loss_mask = torch.stack([pad_mask(x, max_agents) for x in loss_mask_list])
-    non_linear_ped = torch.cat(non_linear_ped_list, dim=0)
-
-    return tuple([
-        obs_traj, pred_traj, obs_traj_rel, pred_traj_rel, non_linear_ped,
-        loss_mask, v_obs, A_obs, v_pred, A_pred, seq_meta_list
-    ])
-
-
 class TrajectoryDataset(Dataset):
     def __init__(
         self, data_dir, obs_len=8, pred_len=8, skip=1, threshold=0.2,
         min_ped=1, delim='\t', norm_lap_matr=True, fill_missing=False, 
         shuffle=False, n_splits=5, dataset_name='', processed_dir='./processed',
-        min_displacement=30.0): # ADDED THRESHOLD HERE
+        min_displacement=30.0): 
         
         super(TrajectoryDataset, self).__init__()
 
@@ -222,7 +162,7 @@ class TrajectoryDataset(Dataset):
         self.processed_dir = processed_dir
         self.min_ped = min_ped
         self.threshold = threshold
-        self.min_displacement = min_displacement # STORED FOR USE
+        self.min_displacement = min_displacement
 
         pkl_files = glob.glob(os.path.join(self.data_dir, "**", "*.pkl"), recursive=True)
         
@@ -337,6 +277,7 @@ class TrajectoryDataset(Dataset):
         non_linear_ped_list = []
         num_peds_in_seq = []
         seq_meta_list = []
+        rot_angle_list = [] # [NEW] Added list to track canonical rotation angles
         
         graph_v_obs = []
         graph_a_obs = []
@@ -352,9 +293,11 @@ class TrajectoryDataset(Dataset):
             curr_seq_data = np.concatenate(frame_data[idx:idx + self.seq_len], axis=0)
             peds_in_curr_seq = np.unique(curr_seq_data[:, 1])
             
+            # [FIXED] Reverted back to 2 channels for Canonical Rotation
             curr_seq_rel = np.zeros((len(peds_in_curr_seq), 2, self.seq_len))
             curr_seq = np.zeros((len(peds_in_curr_seq), 2, self.seq_len))
             curr_loss_mask = np.zeros((len(peds_in_curr_seq), self.seq_len))
+            curr_theta = np.zeros(len(peds_in_curr_seq)) # [NEW] Track angle for this specific scene segment
             
             num_peds_considered = 0
             _non_linear_ped = []
@@ -372,20 +315,16 @@ class TrajectoryDataset(Dataset):
                 curr_obj_seq = np.transpose(curr_obj_seq[:, 2:4]) 
                 
                 # --- STATIONARY AGENT FILTER ---
-                # Calculate maximum distance traveled from their starting point
                 start_pos = curr_obj_seq[:, 0:1] # Shape (2, 1)
                 dists_from_start = np.linalg.norm(curr_obj_seq - start_pos, axis=0)
                 max_displacement = np.max(dists_from_start)
                 
-                # REVISED: Reduced from 30 to 15
                 if max_displacement < 15.0:
-                    continue # Skip this agent, they barely moved
+                    continue 
                 # -------------------------------
 
                 # --- LINEAR AGENT FILTER ---
-                # Fit a 1st-degree polynomial (straight line) to the entire trajectory
                 t_steps = np.arange(self.seq_len)
-                
                 res_x = np.polyfit(t_steps, curr_obj_seq[0, :], 1, full=True)[1]
                 res_y = np.polyfit(t_steps, curr_obj_seq[1, :], 1, full=True)[1]
                 
@@ -393,39 +332,31 @@ class TrajectoryDataset(Dataset):
                 err_y = res_y[0] if len(res_y) > 0 else 0.0
                 total_linear_error = err_x + err_y
                 
-                # REVISED: Reduced from 20 to 5
-                # Only drop agents with LESS than 5 pixel deviation from a perfect line
                 if total_linear_error < 5.0:  
-                    continue # Skip this agent, they are walking in a perfect straight line
+                    continue 
                 # ---------------------------------
-                 # --- PHYSICS FILTER (Tracking Artifacts) ---
-                # Calculate step-by-step velocity vectors
-                vel_vectors = curr_obj_seq[:, 1:] - curr_obj_seq[:, :-1] # Shape: (2, seq_len-1)
                 
+                # --- PHYSICS FILTER (Tracking Artifacts) ---
+                vel_vectors = curr_obj_seq[:, 1:] - curr_obj_seq[:, :-1]
                 v1 = vel_vectors[:, :-1]
                 v2 = vel_vectors[:, 1:]
                 
-                # Calculate dot product and magnitudes
                 dot_products = np.sum(v1 * v2, axis=0)
                 mag1 = np.linalg.norm(v1, axis=0)
                 mag2 = np.linalg.norm(v2, axis=0)
                 
-                # Avoid division by zero (ignore frames where agent is temporarily stopped)
                 valid_mask = (mag1 > 1e-4) & (mag2 > 1e-4)
                 
                 if np.any(valid_mask):
                     cos_angles = dot_products[valid_mask] / (mag1[valid_mask] * mag2[valid_mask])
-                    # Clip to [-1, 1] to avoid arccos nan due to float precision
                     cos_angles = np.clip(cos_angles, -1.0, 1.0)
                     angles_deg = np.degrees(np.arccos(cos_angles))
                     
-                    # If an agent instantly turns more than 120 degrees, it's an ID swap
                     if np.max(angles_deg) > 120.0:
-                        continue # Skip this agent
+                        continue 
                 # -------------------------------------------
 
                 # --- BOUNDARY FILTER (Edge Noise) ---
-                # Remove agents that get too close to the image edges (e.g., 30 original pixels)
                 margin_x = 30.0 * scale_x
                 margin_y = 30.0 * scale_y
                 
@@ -434,15 +365,42 @@ class TrajectoryDataset(Dataset):
                 
                 if (min_x < margin_x) or (max_x > 512.0 - margin_x) or \
                    (min_y < margin_y) or (max_y > 512.0 - margin_y):
-                    continue # Skip this agent, they are touching the edge noise zone
+                    continue 
                 # ------------------------------------
                
-                rel_curr_obj_seq = np.zeros(curr_obj_seq.shape)
-                rel_curr_obj_seq[:, 1:] = curr_obj_seq[:, 1:] - curr_obj_seq[:, :-1]
+                # Calculate relative offsets
+                dx = curr_obj_seq[0, 1:] - curr_obj_seq[0, :-1]
+                dy = curr_obj_seq[1, 1:] - curr_obj_seq[1, :-1]
                 
+                # --- CANONICAL ROTATION (Agent-Centric Frame) ---
+                # Get the velocity vector of the final OBSERVED step
+                last_obs_idx = self.obs_len - 2
+                if last_obs_idx < 0: last_obs_idx = 0
+                
+                last_dx = dx[last_obs_idx]
+                last_dy = dy[last_obs_idx]
+                
+                # Calculate the global angle of this final step
+                theta = np.arctan2(last_dy, last_dx)
+                
+                # Rotate the entire relative trajectory by -theta 
+                # This makes the agent point strictly "Forward" (Positive X)
+                cos_th = np.cos(-theta)
+                sin_th = np.sin(-theta)
+                
+                rot_dx = dx * cos_th - dy * sin_th
+                rot_dy = dx * sin_th + dy * cos_th
+                
+                # Assign back to standard 2-channel tensor
+                rel_curr_obj_seq = np.zeros((2, self.seq_len))
+                rel_curr_obj_seq[0, 1:] = rot_dx
+                rel_curr_obj_seq[1, 1:] = rot_dy
+                # ------------------------------------------------
+
                 _idx = num_peds_considered
                 curr_seq[_idx, :, obj_front:obj_end] = curr_obj_seq
                 curr_seq_rel[_idx, :, obj_front:obj_end] = rel_curr_obj_seq
+                curr_theta[_idx] = theta # [NEW] Store the angle to un-rotate later
                 
                 _non_linear_ped.append(poly_fit(curr_obj_seq, self.pred_len, self.threshold))
                 curr_loss_mask[_idx, obj_front:obj_end] = 1
@@ -453,6 +411,7 @@ class TrajectoryDataset(Dataset):
                 num_peds_in_seq.append(num_peds_considered)
                 loss_mask_list.append(curr_loss_mask[:num_peds_considered])
                 seq_meta_list.append((meta_id, orig_w, orig_h))
+                rot_angle_list.append(curr_theta[:num_peds_considered]) # [NEW] Store angles for batching
                 
                 s_ = curr_seq[:num_peds_considered]
                 s_rel_ = curr_seq_rel[:num_peds_considered]
@@ -480,7 +439,8 @@ class TrajectoryDataset(Dataset):
                 'v_obs': graph_v_obs,
                 'A_obs': graph_a_obs,
                 'v_pred': graph_v_pred,
-                'A_pred': graph_a_pred
+                'A_pred': graph_a_pred,
+                'theta': torch.from_numpy(np.concatenate(rot_angle_list, axis=0)).type(torch.float) # [NEW] Save to file
             }
             with open(save_path, 'wb') as f:
                 pickle.dump(data_dict, f)
@@ -523,6 +483,13 @@ class TrajectoryDataset(Dataset):
         start = self.cum_start_idx[local_idx]
         end = self.cum_start_idx[local_idx+1]
         
+        # Handle backward compatibility for checkpoints/datasets without 'theta'
+        if 'theta' in d:
+            theta = d['theta'][start:end].clone()
+        else:
+            num_peds = end - start
+            theta = torch.zeros(num_peds) # Default to 0 angle (Global Frame)
+
         out = [
             d['obs_traj'][start:end, :].clone(),
             d['pred_traj'][start:end, :].clone(),
@@ -534,10 +501,114 @@ class TrajectoryDataset(Dataset):
             d['A_obs'][local_idx].clone(),
             d['v_pred'][local_idx].clone(),
             d['A_pred'][local_idx].clone(),
-            d['seq_meta'][local_idx]
+            d['seq_meta'][local_idx],
+            theta 
         ]
         return out
 
+
+
     @staticmethod
     def collate_fn(batch):
-        return seq_collate(batch)
+        # 0: obs_traj
+        # 1: pred_traj
+        # 2: obs_traj_rel
+        # 3: pred_traj_rel
+        # 4: non_linear_ped
+        # 5: loss_mask
+        # 6: V_obs
+        # 7: A_obs
+        # 8: V_pred
+        # 9: A_pred
+        # 10: seq_meta
+        # 11: theta
+
+        batch_list = list(zip(*batch))
+        
+        # Get max number of nodes in this batch
+        # element 0 (obs_traj) is [Num_Nodes, 2, Seq_Len] or similar?
+        # Actually __getitem__ returns:
+        # d['obs_traj'][start:end, :] -> [Num_Nodes, 2] ? No, shape is (N, 2) but seq_len is collapsed?
+        # Re-check read_file or seq_to_graph usage.
+        # In __getitem__: d['obs_traj'] is loaded. 
+        # In _process_single_video:
+        # curr_seq is (len(peds), 2, seq_len).
+        # seq_list.append(s_) where s_ is (num_peds, 2, seq_len).
+        # data_dict['obs_traj'] = ... dim 2 is seq_len.
+        # So shape is [Num_Peds_Total, 2, Obs_Len].
+        # In __getitem__, [start:end] slices Num_Peds dimension.
+        # So item[0] is [Num_Peds, 2, Obs_Len].
+        
+        num_peds_list = [item[0].shape[0] for item in batch]
+        max_peds = max(num_peds_list)
+        
+        # Pad Function
+        def pad_tensor(tensor, pad_dim, pad_size):
+            pad_args = [0, 0] * tensor.ndim
+            # Pad dim is counting from last dimension backwards? No, functional.pad arguments are reversed.
+            # But usually we construct a new tensor.
+            pass
+
+        # We need to PAD everything that has Num_Nodes dimension.
+        # Items 0,1,2,3,5 (loss_mask), 11 (theta).
+        # Items 6, 8 (V) -> [Seq_Len, Nodes, Feat]. Pad dim 1.
+        # Items 7, 9 (A) -> [Seq_Len, Nodes, Nodes]. Pad dim 1 and 2.
+        
+        new_batch = []
+        for i, (obs, pred, obs_rel, pred_rel, nl, mask, v_o, a_o, v_p, a_p, meta, th) in enumerate(batch):
+            num_peds = obs.shape[0]
+            pad_peds = max_peds - num_peds
+            
+            if pad_peds > 0:
+                # 0: obs [P, 2, T]
+                obs = torch.cat([obs, torch.zeros(pad_peds, obs.shape[1], obs.shape[2]).type_as(obs)], dim=0)
+                # 1: pred [P, 2, T]
+                pred = torch.cat([pred, torch.zeros(pad_peds, pred.shape[1], pred.shape[2]).type_as(pred)], dim=0)
+                # 2: obs_rel
+                obs_rel = torch.cat([obs_rel, torch.zeros(pad_peds, obs_rel.shape[1], obs_rel.shape[2]).type_as(obs_rel)], dim=0)
+                # 3: pred_rel
+                pred_rel = torch.cat([pred_rel, torch.zeros(pad_peds, pred_rel.shape[1], pred_rel.shape[2]).type_as(pred_rel)], dim=0)
+                # 4: nl [P]
+                nl = torch.cat([nl, torch.zeros(pad_peds).type_as(nl)], dim=0)
+                # 5: mask [P, T]
+                mask = torch.cat([mask, torch.zeros(pad_peds, mask.shape[1]).type_as(mask)], dim=0)
+                # 11: theta [P]
+                th = torch.cat([th, torch.zeros(pad_peds).type_as(th)], dim=0)
+                
+                # 6: V_obs [T, P, F]
+                v_o = torch.cat([v_o, torch.zeros(v_o.shape[0], pad_peds, v_o.shape[2]).type_as(v_o)], dim=1)
+                # 8: V_pred
+                v_p = torch.cat([v_p, torch.zeros(v_p.shape[0], pad_peds, v_p.shape[2]).type_as(v_p)], dim=1)
+                
+                # 7: A_obs [T, P, P]
+                # Pad rows and cols
+                # First pad dim 1 (rows)
+                a_o = torch.cat([a_o, torch.zeros(a_o.shape[0], pad_peds, a_o.shape[2]).type_as(a_o)], dim=1)
+                # Then pad dim 2 (cols)
+                # Now shape is [T, Max, P]. Need to pad cols to Max.
+                a_o = torch.cat([a_o, torch.zeros(a_o.shape[0], a_o.shape[1], pad_peds).type_as(a_o)], dim=2)
+                
+                # 9: A_pred
+                a_p = torch.cat([a_p, torch.zeros(a_p.shape[0], pad_peds, a_p.shape[2]).type_as(a_p)], dim=1)
+                a_p = torch.cat([a_p, torch.zeros(a_p.shape[0], a_p.shape[1], pad_peds).type_as(a_p)], dim=2)
+            
+            new_batch.append((obs, pred, obs_rel, pred_rel, nl, mask, v_o, a_o, v_p, a_p, meta, th))
+            
+        # Refactor into lists
+        batch_list = list(zip(*new_batch))
+        
+        return [
+            torch.stack(batch_list[0]), # obs
+            torch.stack(batch_list[1]), 
+            torch.stack(batch_list[2]), 
+            torch.stack(batch_list[3]), 
+            torch.stack(batch_list[4]), 
+            torch.stack(batch_list[5]), 
+            torch.stack(batch_list[6]), 
+            torch.stack(batch_list[7]), 
+            torch.stack(batch_list[8]), 
+            torch.stack(batch_list[9]), 
+            torch.stack(batch_list[11]), # theta
+            list(batch_list[10])         # meta
+        ]
+

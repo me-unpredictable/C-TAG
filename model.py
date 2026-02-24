@@ -173,6 +173,7 @@ class VSIE(nn.Module):
     def __init__(self, in_feat, output_dim, th):
         super(VSIE, self).__init__()
         self.th = th
+        self.in_feat = in_feat # NEW: Store in_feat dynamically
         self.encoder = nn.LSTM(in_feat, in_feat*2, batch_first=True)
         self.fc = nn.Linear(in_feat*2, in_feat*4)
         self.fc2 = nn.Linear(in_feat, in_feat*4)
@@ -191,11 +192,14 @@ class VSIE(nn.Module):
         batch_size, channels, h_dim, w_dim = feature_map.shape
         _, _, time_steps, num_nodes = agent_coords.shape
         
-        # Permute to [Batch, Time, Nodes, 2]
+        # Permute to [Batch, Time, Nodes, Features]
         coords = agent_coords.permute(0, 2, 3, 1)
         
+        # Extract only x and y coordinates (first 2 features)
+        coords_xy = coords[..., :2]
+        
         # Flatten for grid_sample: [Batch, Time*Nodes, 1, 2]
-        flat_coords = coords.reshape(batch_size, -1, 1, 2)
+        flat_coords = coords_xy.reshape(batch_size, -1, 1, 2)
         
         # Normalize to [-1, 1] for grid_sample
         # (Assumes coordinates are already scaled to 0-512 in utils_by_scene.py)
@@ -259,13 +263,24 @@ class VSIE(nn.Module):
         x_input_coords = x.clone() 
         x_original = x.shape 
 
-        if x.dim() == 4 and x.size(1) == 2:
-            x = x.permute(0, 2, 3, 1) # [B, T, V, C]
+        # Always ensure [B, T, V, C] structure regardless of input channel count
+        if x.dim() == 4:
+            # Check if likely in [B, C, T, V] format
+            # We assume C is smaller than T or V typically, or match self.in_feat logic
+            # If x.size(1) is small (channels), permute.
+            if x.size(1) == self.in_feat or x.size(1) == 2: 
+                 x = x.permute(0, 2, 3, 1) # [B, T, V, C]
+
+        # Auto-pad features if input is 2D (dx, dy) but model expects 4D (dx, dy, v, theta)
+        if x.size(-1) == 2 and self.in_feat == 4:
+            zeros = torch.zeros(x.shape[0], x.shape[1], x.shape[2], 2).to(x.device)
+            x = torch.cat([x, zeros], dim=-1)
         
         x = self.positional_encoding(x)
         
         b, t, n, c_in = x.size()
         x_reshaped = x.contiguous().view(-1, c_in) 
+
         
         X_lstm, _ = self.encoder(x_reshaped.unsqueeze(1)) 
         X = X_lstm.squeeze(1) # [B*T*V, C*2]
@@ -376,7 +391,7 @@ class TemporalTransformer(nn.Module):
 
 
 class CTAG(nn.Module):
-    def __init__(self, threshold, n_gcnn=1, n_tcnn=1, input_feat=2, output_feat=5,
+    def __init__(self, threshold, n_gcnn=1, n_tcnn=1, input_feat=4, output_feat=5,
                  seq_len=8, pred_seq_len=12, kernel_size=3, hidden_size=64):
         super(CTAG, self).__init__()
         self.vsie = VSIE(input_feat, hidden_size, threshold)

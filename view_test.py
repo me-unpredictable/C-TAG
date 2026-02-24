@@ -72,8 +72,25 @@ def evaluate(model, loader, args, num_samples=20):
             batch_tensors = batch[:-1]
             batch_metadata = batch[-1]
             
-            batch_tensors = [t.cuda() for t in batch_tensors]
-            obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr = batch_tensors
+            # Unpack theta (11th element), if present
+            if len(batch_tensors) == 11:
+                 obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr, theta = batch_tensors
+                 theta = theta.cuda()
+            else:
+                 # Maintain backward compatibility if theta is missing
+                 obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr = batch_tensors
+                 theta = None
+
+            batch_tensors = [t.cuda() for t in batch_tensors if torch.is_tensor(t)]
+            # Fix: Ensure all tensors are on CUDA, unpacking correctly after potentially stripping non-tensors
+            # Wait, list comprehension above returns a new list. We need to unpack THIS list.
+            if len(batch_tensors) == 11:
+                 obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr, theta = batch_tensors
+            else:
+                 obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr = batch_tensors
+            
+            # Ensure specific tensors are on cuda (redundant but safe)
+            obs_traj = obs_traj.cuda()
             
             V_obs_tmp = V_obs.permute(0, 3, 1, 2) 
             # NEW: Prepare Absolute Coordinates
@@ -85,6 +102,23 @@ def evaluate(model, loader, args, num_samples=20):
             V_pred = V_pred.permute(0, 2, 3, 1) # [Batch, Time, Nodes, 5] 
             
             V_pred_rel = V_pred[..., :2]
+            
+            # --- INVERSE ROTATION ---
+            if theta is not None:
+                # theta: [Batch, Nodes] (padded)
+                theta_exp = theta.unsqueeze(1).expand_as(V_pred_rel[..., 0])
+                cos_th = torch.cos(theta_exp)
+                sin_th = torch.sin(theta_exp)
+                
+                dx_local = V_pred_rel[..., 0]
+                dy_local = V_pred_rel[..., 1]
+                
+                dx_global = dx_local * cos_th - dy_local * sin_th
+                dy_global = dx_local * sin_th + dy_local * cos_th
+                
+                V_pred_rel = torch.stack([dx_global, dy_global], dim=-1)
+            # ------------------------
+
             V_pred_cumsum = torch.cumsum(V_pred_rel, dim=1)
             
             last_obs = obs_traj[:, :, :, -1].unsqueeze(1) 
