@@ -119,22 +119,22 @@ def train(epoch, model, optimizer, loader_train, metrics):
         # [FIX] Robust Unpacking for Theta
         if len(batch_tensors) == 11:
             obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr, theta = batch_tensors
-            theta = theta.cuda()
+            theta = theta.to(next(model.parameters()).device)
         else:
             obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr = batch_tensors
             theta = None
         
         # Move to GPU
-        obs_traj = obs_traj.cuda()
-        pred_traj_gt = pred_traj_gt.cuda()
-        obs_traj_rel = obs_traj_rel.cuda()
-        pred_traj_gt_rel = pred_traj_gt_rel.cuda()
-        non_linear_ped = non_linear_ped.cuda()
-        loss_mask = loss_mask.cuda()
-        V_obs = V_obs.cuda()
-        A_obs = A_obs.cuda()
-        V_tr = V_tr.cuda()
-        A_tr = A_tr.cuda()
+        obs_traj = obs_traj.to(next(model.parameters()).device)
+        pred_traj_gt = pred_traj_gt.to(next(model.parameters()).device)
+        obs_traj_rel = obs_traj_rel.to(next(model.parameters()).device)
+        pred_traj_gt_rel = pred_traj_gt_rel.to(next(model.parameters()).device)
+        non_linear_ped = non_linear_ped.to(next(model.parameters()).device)
+        loss_mask = loss_mask.to(next(model.parameters()).device)
+        V_obs = V_obs.to(next(model.parameters()).device)
+        A_obs = A_obs.to(next(model.parameters()).device)
+        V_tr = V_tr.to(next(model.parameters()).device)
+        A_tr = A_tr.to(next(model.parameters()).device)
 
         optimizer.zero_grad() 
 
@@ -222,17 +222,17 @@ def calculate_ade_fde(model, loader_val, metrics):
              batch_metadata_list = batch[-1]
              
              # Move tensors to GPU
-             obs_traj = obs_traj.cuda()
-             pred_traj_gt = pred_traj_gt.cuda()
-             obs_traj_rel = obs_traj_rel.cuda()
-             pred_traj_gt_rel = pred_traj_gt_rel.cuda()
-             non_linear_ped = non_linear_ped.cuda()
-             loss_mask = loss_mask.cuda()
-             V_obs = V_obs.cuda()
-             A_obs = A_obs.cuda()
-             V_tr = V_tr.cuda()
-             A_tr = A_tr.cuda()
-             theta = theta.cuda()
+             obs_traj = obs_traj.to(next(model.parameters()).device)
+             pred_traj_gt = pred_traj_gt.to(next(model.parameters()).device)
+             obs_traj_rel = obs_traj_rel.to(next(model.parameters()).device)
+             pred_traj_gt_rel = pred_traj_gt_rel.to(next(model.parameters()).device)
+             non_linear_ped = non_linear_ped.to(next(model.parameters()).device)
+             loss_mask = loss_mask.to(next(model.parameters()).device)
+             V_obs = V_obs.to(next(model.parameters()).device)
+             A_obs = A_obs.to(next(model.parameters()).device)
+             V_tr = V_tr.to(next(model.parameters()).device)
+             A_tr = A_tr.to(next(model.parameters()).device)
+             theta = theta.to(next(model.parameters()).device)
 
              V_obs_tmp = V_obs.permute(0, 3, 1, 2)
              model_metadata = [m[0] for m in batch_metadata_list] 
@@ -344,7 +344,7 @@ def vald(epoch, model, loader_val, metrics, constant_metrics):
             batch_tensors = batch[:-1] 
             batch_metadata_list = batch[-1]
             
-            batch = [tensor.cuda() for tensor in batch_tensors]
+            batch = [tensor.to(next(model.parameters()).device) for tensor in batch_tensors]
             
             # [FIX] Unpack theta (11th element), if present. Handle backward compatibility.
             if len(batch) == 11:
@@ -438,12 +438,15 @@ if __name__ == '__main__':
     # -----------------------------------------------------------------------------
     processed_train_dir = os.path.join('./processed/train', args.scene_name)
     processed_val_dir = os.path.join('./processed/val', args.scene_name)
+    processed_test_dir = os.path.join('./processed/test', args.scene_name)
 
     # Check if processed data exists for this scene
-    files_exist = os.path.exists(processed_train_dir) and len(glob.glob(os.path.join(processed_train_dir, "*.pkl"))) > 0
+    train_exists = os.path.exists(processed_train_dir) and len(glob.glob(os.path.join(processed_train_dir, "*.pkl"))) > 0
+    val_exists = os.path.exists(processed_val_dir) and len(glob.glob(os.path.join(processed_val_dir, "*.pkl"))) > 0
+    test_exists = os.path.exists(processed_test_dir) and len(glob.glob(os.path.join(processed_test_dir, "*.pkl"))) > 0
 
-    if args.reload_data or not files_exist:
-        print(f"Processed data for {args.scene_name} missing or reload requested. Generating splits from RAW data...")
+    if args.reload_data or not (train_exists and val_exists and test_exists):
+        print(f"Processed data for {args.scene_name} missing splits or reload requested. Generating splits from RAW data...")
         # This generates ALL scenes into ./processed
         _ = TrajectoryDataset(
             data_dir=args.dataset_path,
@@ -452,7 +455,8 @@ if __name__ == '__main__':
             skip=1,
             norm_lap_matr=True,
             delim=args.delim,
-            dataset_name=args.dataset
+            dataset_name=args.dataset,
+            reload_data=args.reload_data
         )
         print("Data generation complete.")
 

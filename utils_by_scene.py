@@ -143,7 +143,7 @@ class TrajectoryDataset(Dataset):
         self, data_dir, obs_len=8, pred_len=8, skip=1, threshold=0.2,
         min_ped=1, delim='\t', norm_lap_matr=True, fill_missing=False, 
         shuffle=False, n_splits=5, dataset_name='', processed_dir='./processed',
-        min_displacement=30.0): 
+        min_displacement=30.0, reload_data=False): 
         
         super(TrajectoryDataset, self).__init__()
 
@@ -163,6 +163,7 @@ class TrajectoryDataset(Dataset):
         self.min_ped = min_ped
         self.threshold = threshold
         self.min_displacement = min_displacement
+        self.reload_data = reload_data
 
         pkl_files = glob.glob(os.path.join(self.data_dir, "**", "*.pkl"), recursive=True)
         
@@ -229,6 +230,9 @@ class TrajectoryDataset(Dataset):
                         meta_id = f"{scene_name}_{v}_map.pt" 
                         save_name = f"{scene_name}_{v}.pkl"
                         save_path = os.path.join(split_out_dir, save_name)
+
+                        if os.path.exists(save_path) and not self.reload_data:
+                            continue
 
                         img_path = os.path.join(current_scene_path, v, 'reference.jpg')
                         if not os.path.exists(img_path):
@@ -319,7 +323,7 @@ class TrajectoryDataset(Dataset):
                 dists_from_start = np.linalg.norm(curr_obj_seq - start_pos, axis=0)
                 max_displacement = np.max(dists_from_start)
                 
-                if max_displacement < 15.0:
+                if max_displacement < 1.0: # people can be standing, but still there will be always slight motion
                     continue 
                 # -------------------------------
 
