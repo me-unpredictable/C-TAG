@@ -187,7 +187,7 @@ class VSIE(nn.Module):
         
         # 2. Widen Fusion Layer: Input is Motion(in_feat*2) + Visual(256)
         self.visual_fusion = nn.Linear((in_feat*2) + 256, in_feat*2)
-
+        self.fusion_dropout = nn.Dropout(0.5) 
     def extract_local_context(self, feature_map, agent_coords, img_w=512.0, img_h=512.0):
         batch_size, channels, h_dim, w_dim = feature_map.shape
         _, _, time_steps, num_nodes = agent_coords.shape
@@ -303,8 +303,8 @@ class VSIE(nn.Module):
             local_context_flat = local_context.reshape(X.shape[0], -1)
             
             fused_features = torch.cat([X, local_context_flat], dim=-1)
-            X = self.visual_fusion(fused_features)
-            
+            # X = self.visual_fusion(fused_features)
+            X = self.fusion_dropout(self.visual_fusion(fused_features))
         Q = self.fc(X)     
         K = self.fc2(X) 
         v = self.fc3(X) 
@@ -472,7 +472,15 @@ class CTAG(nn.Module):
         # v is [Batch, 2, Time, Nodes] (input from train.py)
         # We need map_tensor to be [Batch, C, H, W] to match v's Batch dim
         map_tensor = torch.stack(maps_list, dim=0)
-
+        # adding random noise to the map tensor to prevent overfitting and encourage generalization
+        if self.training: # Only apply noise during training, not validation
+            # Create random noise with a standard deviation of 0.1
+            noise = torch.randn_like(map_tensor) * 0.1 
+            map_tensor = map_tensor + noise
+        if self.training:
+            # Randomly zero out 20% of the visual features
+            dropout_layer = nn.Dropout2d(p=0.2)
+            map_tensor = dropout_layer(map_tensor)
         # Pass to VSIE (Compressor inside VSIE will attach grad)
         v = self.vsie(v, abs_coords, map_tensor) 
         # v = self.vsie(v, None) # run this to check if map has a bug

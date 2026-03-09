@@ -159,36 +159,28 @@ def train(epoch, model, optimizer, loader_train, metrics):
         V_pred = V_pred.permute(0, 2, 3, 1) # [Batch, Time, Nodes, 5]
         
         # 4. Loss
-        # --- INTEGRATE TO ABSOLUTE FOR LOSS ---
-        # V_pred outputs RELATIVE offsets in the CANONICAL frame
-        # We need to rotate these offsets BACK to the global frame before integrating
+        # V_pred outputs RELATIVE offsets in the CANONICAL (local) frame.
+        # Its sigmas/rho are also local (Forward/Lateral variance).
+        # We MUST compute the loss in this local frame so the covariance aligns!
         
-        V_pred_rel = V_pred[..., :2]
+        V_pred_rel_local = V_pred[..., :2]
+        V_pred_abs_local_mu = torch.cumsum(V_pred_rel_local, dim=1)
         
-        # [FIX] Inverse Rotation if theta exists
-        if theta is not None:
-             theta_exp = theta.unsqueeze(1).expand_as(V_pred_rel[..., 0])
-             cos_th = torch.cos(theta_exp)
-             sin_th = torch.sin(theta_exp)
-             dx, dy = V_pred_rel[..., 0], V_pred_rel[..., 1]
-             dx_g = dx * cos_th - dy * sin_th
-             dy_g = dx * sin_th + dy * cos_th
-             V_pred_rel_global = torch.stack([dx_g, dy_g], dim=-1)
-        else:
-             V_pred_rel_global = V_pred_rel
+        # Reattach the sigmas and correlation (All remain in the local frame)
+        V_pred_abs_local = torch.cat([V_pred_abs_local_mu, V_pred[..., 2:]], dim=-1)
         
-        V_pred_cumsum = torch.cumsum(V_pred_rel_global, dim=1)
-        last_obs = obs_traj[:, :, :, -1].unsqueeze(1) # [Batch, 1, Nodes, 2]
-        V_pred_abs_mu = V_pred_cumsum + last_obs
-        # Reattach the sigmas and correlation (Unchanged by rotation)
-        V_pred_abs = torch.cat([V_pred_abs_mu, V_pred[..., 2:]], dim=-1)
-        # Target must also be absolute!
-        V_tr_abs = pred_traj_gt.permute(0, 3, 1, 2)
+        # Get Ground Truth Relative offsets (already local from dataloader)
+        V_tr_rel_local = pred_traj_gt_rel.permute(0, 3, 1, 2)
+        
+        # Integrate to get local absolute target 
+        # (Origin is 0,0 at last_obs, so we don't need to add last_obs here)
+        V_tr_abs_local = torch.cumsum(V_tr_rel_local, dim=1)
+        
         mask_perm = loss_mask.permute(0, 2, 1)
         mask_perm = mask_perm[:, -args.pred_seq_len:, :]
         
-        # Calculate loss on Absolute Paths
-        loss = graph_loss(V_pred_abs, V_tr_abs, mask_perm, use_mse=use_mse)
+        # Calculate loss on Local Absolute Paths
+        loss = graph_loss(V_pred_abs_local, V_tr_abs_local, mask_perm, use_mse=use_mse)
 
         
         # Check for NaN
@@ -362,33 +354,29 @@ def vald(epoch, model, loader_val, metrics, constant_metrics):
             # Pass abs_coords to the model
             V_pred, _ = model(V_obs_tmp, A_obs, abs_coords, model_metadata)
             V_pred = V_pred.permute(0, 2, 3, 1)
-            # Integrate to Absolute for Validation Loss
-            V_pred_rel = V_pred[..., :2]
+            # 4. Loss
+            # V_pred outputs RELATIVE offsets in the CANONICAL (local) frame.
+            # Its sigmas/rho are also local (Forward/Lateral variance).
+            # We MUST compute the loss in this local frame so the covariance aligns!
             
-            # --- INVERSE ROTATION ---
-            if theta is not None:
-                theta_exp = theta.unsqueeze(1).expand_as(V_pred_rel[..., 0])
-                cos_th = torch.cos(theta_exp)
-                sin_th = torch.sin(theta_exp)
-                dx, dy = V_pred_rel[..., 0], V_pred_rel[..., 1]
-                dx_g = dx * cos_th - dy * sin_th
-                dy_g = dx * sin_th + dy * cos_th
-                V_pred_rel = torch.stack([dx_g, dy_g], dim=-1)
-            # ------------------------
+            V_pred_rel_local = V_pred[..., :2]
+            V_pred_abs_local_mu = torch.cumsum(V_pred_rel_local, dim=1)
             
-            V_pred_cumsum = torch.cumsum(V_pred_rel, dim=1)
-            last_obs = obs_traj[:, :, :, -1].unsqueeze(1) 
-            V_pred_abs_mu = V_pred_cumsum + last_obs
+            # Reattach the sigmas and correlation (All remain in the local frame)
+            V_pred_abs_local = torch.cat([V_pred_abs_local_mu, V_pred[..., 2:]], dim=-1)
             
-            # Reattach sigmas and correlation
-            V_pred_abs = torch.cat([V_pred_abs_mu, V_pred[..., 2:]], dim=-1)
-            V_tr_abs = pred_traj_gt.permute(0, 3, 1, 2)
+            # Get Ground Truth Relative offsets (already local from dataloader)
+            V_tr_rel_local = pred_traj_gt_rel.permute(0, 3, 1, 2)
+            
+            # Integrate to get local absolute target 
+            # (Origin is 0,0 at last_obs, so we don't need to add last_obs here)
+            V_tr_abs_local = torch.cumsum(V_tr_rel_local, dim=1)
             
             mask_perm = loss_mask.permute(0, 2, 1)
             mask_perm = mask_perm[:, -args.pred_seq_len:, :]
             
-            # Calculate Loss
-            loss = graph_loss(V_pred_abs, V_tr_abs, mask_perm, use_mse=use_mse)
+            # Calculate loss on Local Absolute Paths
+            loss = graph_loss(V_pred_abs_local, V_tr_abs_local, mask_perm, use_mse=use_mse)
 
             loss_batch += loss.item()
             pbar.set_postfix({'Loss': loss_batch / (cnt + 1)})
@@ -518,7 +506,7 @@ if __name__ == '__main__':
     ).to(device)
     # Optimizer and Scheduler
     # optimizer = optim.SGD(model.parameters(), lr=args.lr)
-    optimizer = optim.Adam(model.parameters(), lr=0.001) # Lower LR for Adam
+    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4) # Lower LR for Adam
     if args.use_lrschd:
         # Changed to ReduceLROnPlateau for better convergence checking
       scheduler = optim.lr_scheduler.ReduceLROnPlateau(
