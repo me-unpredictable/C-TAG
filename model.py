@@ -473,14 +473,13 @@ class CTAG(nn.Module):
         # We need map_tensor to be [Batch, C, H, W] to match v's Batch dim
         map_tensor = torch.stack(maps_list, dim=0)
         # adding random noise to the map tensor to prevent overfitting and encourage generalization
-        if self.training: # Only apply noise during training, not validation
+        if self.training:
             # Create random noise with a standard deviation of 0.1
             noise = torch.randn_like(map_tensor) * 0.1 
             map_tensor = map_tensor + noise
-        if self.training:
-            # Randomly zero out 20% of the visual features
-            dropout_layer = nn.Dropout2d(p=0.2)
-            map_tensor = dropout_layer(map_tensor)
+            
+            # Use functional dropout2d (No object instantiation)
+            map_tensor = Func.dropout2d(map_tensor, p=0.2, training=self.training)
         # Pass to VSIE (Compressor inside VSIE will attach grad)
         v = self.vsie(v, abs_coords, map_tensor) 
         # v = self.vsie(v, None) # run this to check if map has a bug
