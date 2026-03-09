@@ -1,6 +1,4 @@
-from ast import arg
-from operator import le
-from re import A, split
+import argparse
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -8,19 +6,19 @@ from torchvision import models
 import torchvision.transforms as transforms
 from PIL import Image
 import os
-import argparse
+import numpy as np
 
+parser = argparse.ArgumentParser()
+parser.add_argument('--dataset_root', type=str, default='/path/to/dataset/root', help='Path to the dataset root directory')
+parser.add_argument('--dataset_path', type=str, default='./processed', help='Path to save processed data')
+parser.add_argument('--dataset_name', type=str, default='SDD', help='Name of the dataset being used')
+parser.add_argument('--bad_map', action='store_true', help='Use robust 50 percent gaussian noise on the input map')
+parser.add_argument('--white_map', action='store_true', help='Use purely white images instead of original maps')
+args = parser.parse_args()
 
-argparse = argparse.ArgumentParser()
-argparse.add_argument('--dataset_root', type=str, default='/path/to/dataset/root', help='Path to the dataset root directory')
-argparse.add_argument('--dataset_path', type=str, default='./processed', help='Path to save processed data')
-argparse.add_argument('--dataset_name', type=str, default='SDD', help='Name of the dataset being used')
-args = argparse.parse_args()
 dataset_root = args.dataset_root
 dataset_path = args.dataset_path
 dataset_name = args.dataset_name
-
-
 
 # ==========================================
 # 0. VISUAL BACKBONE (From Step 1 - Approved)
@@ -79,16 +77,26 @@ def extract_features_for_agent(feature_map, agent_df, orig_w, orig_h):
     # Reshape to [Time, Channels] (Batch size 1 assumed for single scene)
     return sampled.squeeze(0).squeeze(-1).permute(1, 0)
 
-def extract_map_features(img_path,map_file_name,dataset_path='./processed'):
+def extract_map_features(img_path, map_file_name, dataset_path='./processed', bad_map=False, white_map=False):
     # now we are all set for processing the dataset
 
     resize_dim = (512, 512) # standard input size for ResNet50
 
     # # --- B. LOAD IMAGE ---
     orig_img = Image.open(img_path).convert('RGB')
-    
     orig_w, orig_h = orig_img.size
     print(f"Original Image Size: {orig_w} x {orig_h}")
+    
+    if white_map:
+        # Create a purely white image
+        orig_img = Image.new('RGB', (orig_w, orig_h), (255, 255, 255))
+    elif bad_map:
+        # Add 50% Gaussian Noise 
+        # Range of images is 0-255. A standard deviation of roughly 50% of the range is ~127.5
+        img_np = np.array(orig_img).astype(np.float32)
+        noise = np.random.normal(scale=127.5, size=img_np.shape)
+        noisy_img = np.clip(img_np + noise, 0, 255).astype(np.uint8)
+        orig_img = Image.fromarray(noisy_img)
 
     # Prepare input tensor
     transform = transforms.Compose([
@@ -105,15 +113,14 @@ def extract_map_features(img_path,map_file_name,dataset_path='./processed'):
     with torch.no_grad():
         feature_map = model(input_tensor)
     
-    print(f"Feature Map Shape: {feature_map.shape}") # Should be [1, 2048, 16, 16]
+    print(f"Feature Map Shape: {feature_map.shape} for {map_file_name}") # Should be [1, 2048, 16, 16]
 
-    
     # save the processed map features to processed directory
-    save_path=os.path.join(dataset_path,map_file_name)
+    save_path = os.path.join(dataset_path, map_file_name)
     torch.save(feature_map, save_path)
 
 
-def save_map_features(dataset_root,dataset_path='./processed'):
+def save_map_features(dataset_root, dataset_path='./processed', bad_map=False, white_map=False):
     
     # check if processed dir exists
     # we will store all of our map and trajectory data in it.
@@ -121,42 +128,55 @@ def save_map_features(dataset_root,dataset_path='./processed'):
         os.makedirs(dataset_path)
     
     # check the dataset root
-    dirs=os.listdir(dataset_root)
+    try:
+        dirs = os.listdir(dataset_root)
+    except FileNotFoundError:
+        print(f"Dataset root {dataset_root} not found! Please provide a valid path.")
+        return
 
-    if dataset_name=='SDD':
+    # Determine save directory name
+    map_dir_name = 'maps'
+    if bad_map:
+        map_dir_name = 'bad_maps'
+    elif white_map:
+        map_dir_name = 'white_maps'
+
+    if dataset_name == 'SDD':
         # dataset root must contain annotation and videos folders for SDD
         assert 'annotations' in dirs, "annotations folder not found in dataset root"
         # only checking for annotation as we just need map and trajectory data
         # get avilable scenes
-        scenes=os.listdir(os.path.join(dataset_root,'annotations'))
+        scenes = os.listdir(os.path.join(dataset_root, 'annotations'))
         # check if maps dir exists in processed dir
-        if not os.path.exists(os.path.join(dataset_path,'maps')):
-            os.makedirs(os.path.join(dataset_path,'maps'))
+        if not os.path.exists(os.path.join(dataset_path, map_dir_name)):
+            os.makedirs(os.path.join(dataset_path, map_dir_name))
 
         # now we will start processing each split
         for s in scenes:
             # enlist number of videos in the scene
-            videos=os.listdir(os.path.join(dataset_root,'annotations',s))
+            videos = os.listdir(os.path.join(dataset_root, 'annotations', s))
             for v in videos:
                 # name of the processed map file
                 # s_v_map.pt in processed/train or val or test dir
-                map_file_name=os.path.join('maps','{}_{}_map.pt'.format(s,v))
+                map_file_name = os.path.join(map_dir_name, '{}_{}_map.pt'.format(s,v))
                 # enlist all jpg files in the video folder
-                img_files=os.listdir(os.path.join(dataset_root,'annotations',s,v))
+                img_files = os.listdir(os.path.join(dataset_root, 'annotations', s, v))
                 # filter only jpg files
-                img_files=[f for f in img_files if f.endswith('.jpg')]
+                img_files = [f for f in img_files if f.endswith('.jpg')]
                 # if there are more than 1 jpg files then we will process reference.jpg
                 # otherwise whatever named jpg file is there we will process it
-                if len(img_files)>1:
-                    img_path=os.path.join(dataset_root,'annotations',s,v,'reference.jpg')
+                if len(img_files) > 1:
+                    img_path = os.path.join(dataset_root, 'annotations', s, v, 'reference.jpg')
                 else:
                     try:
-                        img_path=os.path.join(dataset_root,'annotations',s,v,img_files[0])
+                        img_path = os.path.join(dataset_root, 'annotations', s, v, img_files[0])
                     except IndexError:
-                        print(f"No jpg files found in {os.path.join(dataset_root,'annotations',s,v)}")
+                        print(f"No jpg files found in {os.path.join(dataset_root, 'annotations', s, v)}")
                         continue
                 # extract map features
-                extract_map_features(img_path,map_file_name)
-    print("All map features extracted and saved.")
-print("Map feature extraction module loaded.")
-save_map_features(dataset_root,dataset_path)
+                extract_map_features(img_path, map_file_name, dataset_path=dataset_path, bad_map=bad_map, white_map=white_map)
+    print(f"All map features extracted and saved to {map_dir_name}.")
+
+if __name__ == '__main__':
+    print("Map feature extraction module loaded.")
+    save_map_features(dataset_root, dataset_path, args.bad_map, args.white_map)

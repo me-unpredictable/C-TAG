@@ -176,8 +176,8 @@ class VSIE(nn.Module):
         self.in_feat = in_feat # NEW: Store in_feat dynamically
         self.encoder = nn.LSTM(in_feat, in_feat*2, batch_first=True)
         self.fc = nn.Linear(in_feat*2, in_feat*4)
-        self.fc2 = nn.Linear(in_feat, in_feat*4)
-        self.fc3 = nn.Linear(in_feat, in_feat*4)
+        self.fc2 = nn.Linear(in_feat*2, in_feat*4)
+        self.fc3 = nn.Linear(in_feat*2, in_feat*4)
         self.fc_out = nn.Linear(in_feat*4, output_dim)
 
         # --- C-TAG CAPACITY FIX ---
@@ -306,8 +306,8 @@ class VSIE(nn.Module):
             X = self.visual_fusion(fused_features)
             
         Q = self.fc(X)     
-        K = self.fc2(x_reshaped) 
-        v = self.fc3(x_reshaped) 
+        K = self.fc2(X) 
+        v = self.fc3(X) 
         
         # Batched Attention
         q_dim = Q.shape[-1]
@@ -440,22 +440,33 @@ class CTAG(nn.Module):
         else:
             meta_batch = [metadata] # Handle single item (Batch=1)
             
+        # NEW: Cache to store unique maps loaded during this specific forward pass
+        batch_map_cache = {}
+            
         for meta_item in meta_batch:
             # Logic to parse filename from metadata item
             # Revert to simple string conversion if it's just the filename string
             pt_filename = str(meta_item)
             
-            map_path = os.path.join('./processed/maps', pt_filename)
-            
-            if not os.path.exists(map_path):
-                 # Fallback logic if needed, or raise cleaner error
-                 raise FileNotFoundError(f"Visual Context Map not found: {map_path}")
-            
-            # Load map [C, H, W]
-            single_map = torch.load(map_path, map_location=v.device)
-            if single_map.dim() == 4:
-                single_map = single_map.squeeze(0)
-            maps_list.append(single_map)
+            # Check if we already loaded this map for a previous agent in this batch
+            if pt_filename not in batch_map_cache:
+                map_path = os.path.join('./processed/maps', pt_filename)
+                
+                if not os.path.exists(map_path):
+                     # Fallback logic if needed, or raise cleaner error
+                     raise FileNotFoundError(f"Visual Context Map not found: {map_path}")
+                
+                # Load map [C, H, W]
+                # Load from disk ONLY if it's not in our cache
+                single_map = torch.load(map_path, map_location=v.device)
+                if single_map.dim() == 4:
+                    single_map = single_map.squeeze(0)
+                
+                # Save to cache for subsequent agents
+                batch_map_cache[pt_filename] = single_map
+                
+            # Append the tensor directly from memory
+            maps_list.append(batch_map_cache[pt_filename])
             
         # Stack into [Batch, C, H, W]
         # v is [Batch, 2, Time, Nodes] (input from train.py)
