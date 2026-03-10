@@ -140,10 +140,10 @@ def seq_to_graph(seq_, seq_rel, norm_lap_matr=True):
 
 class TrajectoryDataset(Dataset):
     def __init__(
-        self, data_dir, obs_len=8, pred_len=8, skip=1, threshold=0.2,
+        self, data_dir, obs_len=8, pred_len=12, skip=1, threshold=0.2,
         min_ped=1, delim='\t', norm_lap_matr=True, fill_missing=False, 
         shuffle=False, n_splits=5, dataset_name='', processed_dir='./processed',
-        min_displacement=30.0, reload_data=False): 
+        min_displacement=30.0, reload_data=False, target_set='all'): 
         
         super(TrajectoryDataset, self).__init__()
 
@@ -164,6 +164,7 @@ class TrajectoryDataset(Dataset):
         self.threshold = threshold
         self.min_displacement = min_displacement
         self.reload_data = reload_data
+        self.target_set = target_set
 
         pkl_files = glob.glob(os.path.join(self.data_dir, "**", "*.pkl"), recursive=True)
         
@@ -219,6 +220,8 @@ class TrajectoryDataset(Dataset):
                 print(f"Scene: {scene_name} ({num_videos} videos) | Train: {len(train_v)}, Val: {len(val_v)}, Test: {len(test_v)}")
 
                 for s_name in splits:
+                    if self.target_set != 'all' and s_name != self.target_set:
+                        continue
                     videos_in_split = splits[s_name]
                     split_out_dir = os.path.join(self.processed_dir, s_name, scene_name)
                     os.makedirs(split_out_dir, exist_ok=True)
@@ -323,7 +326,7 @@ class TrajectoryDataset(Dataset):
                 dists_from_start = np.linalg.norm(curr_obj_seq - start_pos, axis=0)
                 max_displacement = np.max(dists_from_start)
                 
-                if max_displacement < 1.0: # people can be standing, but still there will be always slight motion
+                if max_displacement < 16.0: #B people can be standing, but still there will be always slight motion
                     continue 
                 # -------------------------------
 
@@ -336,7 +339,7 @@ class TrajectoryDataset(Dataset):
                 err_y = res_y[0] if len(res_y) > 0 else 0.0
                 total_linear_error = err_x + err_y
                 
-                if total_linear_error < 5.0:  
+                if total_linear_error < 1.0:  #B
                     continue 
                 # ---------------------------------
                 
@@ -356,7 +359,7 @@ class TrajectoryDataset(Dataset):
                     cos_angles = np.clip(cos_angles, -1.0, 1.0)
                     angles_deg = np.degrees(np.arccos(cos_angles))
                     
-                    if np.max(angles_deg) > 120.0:
+                    if np.max(angles_deg) > 80.0: #B
                         continue 
                 # -------------------------------------------
 
@@ -616,3 +619,27 @@ class TrajectoryDataset(Dataset):
             list(batch_list[10])         # meta
         ]
 
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser(description="Process trajectory dataset and generate .pkl files.")
+    parser.add_argument('--dataset_root', type=str, required=True, help="Root directory of the dataset (e.g. where annotations folder is)")
+    parser.add_argument('--dataset_name', type=str, default='sdd', help="Dataset name, e.g. sdd")
+    parser.add_argument('--processed_dir', type=str, default='./processed', help="Directory to save the processed files")
+    parser.add_argument('--set', type=str, default='all', choices=['all', 'train', 'val', 'test'], help="Which split to generate")
+    parser.add_argument('--obs_len', type=int, default=8, help="Observation length")
+    parser.add_argument('--pred_len', type=int, default=12, help="Prediction length")
+    parser.add_argument('--reload_data', action='store_true', help="Force re-generation of files")
+    
+    args = parser.parse_args()
+    
+    dataset = TrajectoryDataset(
+        data_dir=args.dataset_root,
+        dataset_name=args.dataset_name,
+        processed_dir=args.processed_dir,
+        obs_len=args.obs_len,
+        pred_len=args.pred_len,
+        target_set=args.set,
+        reload_data=args.reload_data
+    )
+    print("Done!")
