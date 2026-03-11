@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
+import seaborn as sns
 
 # Import your modules
 from model import CTAG
@@ -135,6 +136,10 @@ def evaluate(model, loader, args, num_samples=20):
             target_list = []
             count_list = []
 
+            # Un-rotate samples
+            if theta is not None:
+                theta_np = theta.cpu().numpy()
+            
             for i in range(batch_size):
                 meta_id, orig_w, orig_h = batch_metadata[i]
                 unscale_x = orig_w / 512.0
@@ -186,6 +191,18 @@ def evaluate(model, loader, args, num_samples=20):
                         ])
                         sample_rel[:, t, :] = np.random.multivariate_normal(mu[t], cov, size=num_samples)
 
+                    # --- UNROTATE SAMPLES TO GLOBAL FRAME ---
+                    if theta is not None:
+                        th = theta_np[i, ped_idx]
+                        cos_th_val = np.cos(th)
+                        sin_th_val = np.sin(th)
+                        dx_s = sample_rel[..., 0]
+                        dy_s = sample_rel[..., 1]
+                        unrot_dx_s = dx_s * cos_th_val - dy_s * sin_th_val
+                        unrot_dy_s = dx_s * sin_th_val + dy_s * cos_th_val
+                        sample_rel = np.stack([unrot_dx_s, unrot_dy_s], axis=-1)
+                    # ----------------------------------------
+
                     last_obs = obs_traj_np[i, -1, ped_idx, :2]
                     sample_abs = np.cumsum(sample_rel, axis=1) + last_obs[None, None, :]
                     sample_abs[..., 0] *= unscale_x
@@ -210,7 +227,7 @@ def evaluate(model, loader, args, num_samples=20):
     
     return ped_trajectories
 
-def plot_top_5_trajectories(ped_trajectories, data_dir, no_map=False):
+def plot_top_5_trajectories(ped_trajectories, data_dir, no_map=False, heat=False):
     # Filter out people who moved less than 15 pixels overall
     moving_trajectories = [t for t in ped_trajectories if t['displacement'] > 15.0]
     
@@ -248,15 +265,20 @@ def plot_top_5_trajectories(ped_trajectories, data_dir, no_map=False):
         
         plt.plot(obs[:, 0], obs[:, 1], color='blue', marker='o', linestyle='-', linewidth=2, label='Observed History', markersize=4)
         plt.plot(gt[:, 0], gt[:, 1], color='green', marker='s', linestyle='-', linewidth=2, label='Ground Truth Future', markersize=4)
+        
+        if heat:
+            sample_points = pred_samples.reshape(-1, 2)
+            sns.kdeplot(x=sample_points[:, 0], y=sample_points[:, 1], fill=True, alpha=0.3, cmap="Reds", thresh=0.01, levels=10, cut=0)
+
         for s_idx in range(pred_samples.shape[0]):
             color = sample_colors(s_idx)
             label = 'Predicted Samples' if s_idx == 0 else None
-            plt.plot(pred_samples[s_idx, :, 0], pred_samples[s_idx, :, 1], color=color, linestyle='--', linewidth=1.5, label=label, alpha=0.85)
+            plt.plot(pred_samples[s_idx, :, 0], pred_samples[s_idx, :, 1], color=color, linestyle='--', linewidth=1.5, label=label, alpha=0.15 if heat else 0.85)
         
         plt.plot([obs[-1, 0], gt[0, 0]], [obs[-1, 1], gt[0, 1]], color='green', linestyle='-', linewidth=2)
         for s_idx in range(pred_samples.shape[0]):
             color = sample_colors(s_idx)
-            plt.plot([obs[-1, 0], pred_samples[s_idx, 0, 0]], [obs[-1, 1], pred_samples[s_idx, 0, 1]], color=color, linestyle='--', linewidth=1)
+            plt.plot([obs[-1, 0], pred_samples[s_idx, 0, 0]], [obs[-1, 1], pred_samples[s_idx, 0, 1]], color=color, linestyle='--', linewidth=1, alpha=0.15 if heat else 1.0)
         
         if map_img_path and not no_map:
             img = mpimg.imread(map_img_path)
@@ -281,7 +303,7 @@ def plot_top_5_trajectories(ped_trajectories, data_dir, no_map=False):
         
         plt.show()
 
-def plot_bottom_5_trajectories(ped_trajectories, data_dir, no_map=False):
+def plot_bottom_5_trajectories(ped_trajectories, data_dir, no_map=False, heat=False):
     # Filter out people who moved less than 15 pixels overall
     moving_trajectories = [t for t in ped_trajectories if t['displacement'] > 15.0]
     
@@ -319,15 +341,20 @@ def plot_bottom_5_trajectories(ped_trajectories, data_dir, no_map=False):
         
         plt.plot(obs[:, 0], obs[:, 1], color='blue', marker='o', linestyle='-', linewidth=2, label='Observed History', markersize=4)
         plt.plot(gt[:, 0], gt[:, 1], color='green', marker='s', linestyle='-', linewidth=2, label='Ground Truth Future', markersize=4)
+        
+        if heat:
+            sample_points = pred_samples.reshape(-1, 2)
+            sns.kdeplot(x=sample_points[:, 0], y=sample_points[:, 1], fill=True, alpha=0.3, cmap="Reds", thresh=0.01, levels=10, cut=0)
+
         for s_idx in range(pred_samples.shape[0]):
             color = sample_colors(s_idx)
             label = 'Predicted Samples' if s_idx == 0 else None
-            plt.plot(pred_samples[s_idx, :, 0], pred_samples[s_idx, :, 1], color=color, linestyle='--', linewidth=1.5, label=label, alpha=0.85)
+            plt.plot(pred_samples[s_idx, :, 0], pred_samples[s_idx, :, 1], color=color, linestyle='--', linewidth=1.5, label=label, alpha=0.15 if heat else 0.85)
         
         plt.plot([obs[-1, 0], gt[0, 0]], [obs[-1, 1], gt[0, 1]], color='green', linestyle='-', linewidth=2)
         for s_idx in range(pred_samples.shape[0]):
             color = sample_colors(s_idx)
-            plt.plot([obs[-1, 0], pred_samples[s_idx, 0, 0]], [obs[-1, 1], pred_samples[s_idx, 0, 1]], color=color, linestyle='--', linewidth=1)
+            plt.plot([obs[-1, 0], pred_samples[s_idx, 0, 0]], [obs[-1, 1], pred_samples[s_idx, 0, 1]], color=color, linestyle='--', linewidth=1, alpha=0.15 if heat else 1.0)
         
         if map_img_path and not no_map:
             img = mpimg.imread(map_img_path)
@@ -355,6 +382,7 @@ def plot_bottom_5_trajectories(ped_trajectories, data_dir, no_map=False):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--no_map', action='store_true', help='Disable map and show only close up of trajectories')
+    parser.add_argument('--heat', action='store_true', help='Show heatmap for predicted trajectories')
     cmd_args = parser.parse_args()
 
     model_path, args_path = get_model_path()
@@ -419,7 +447,7 @@ def main():
     ped_trajectories = evaluate(model, loader_test, args, num_samples=20)
     
     if ped_trajectories:
-        plot_top_5_trajectories(ped_trajectories, test_data_dir, no_map=cmd_args.no_map)
-        plot_bottom_5_trajectories(ped_trajectories, test_data_dir, no_map=cmd_args.no_map)
+        plot_top_5_trajectories(ped_trajectories, test_data_dir, no_map=cmd_args.no_map, heat=cmd_args.heat)
+        plot_bottom_5_trajectories(ped_trajectories, test_data_dir, no_map=cmd_args.no_map, heat=cmd_args.heat)
 if __name__ == '__main__':
     main()
