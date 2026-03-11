@@ -158,29 +158,38 @@ def train(epoch, model, optimizer, loader_train, metrics):
         V_pred, _ = model(V_obs_tmp, A_obs, abs_coords, model_metadata) 
         V_pred = V_pred.permute(0, 2, 3, 1) # [Batch, Time, Nodes, 5]
         
-        # 4. Loss
-        # V_pred outputs RELATIVE offsets in the CANONICAL (local) frame.
-        # Its sigmas/rho are also local (Forward/Lateral variance).
-        # We MUST compute the loss in this local frame so the covariance aligns!
+        # --- CANONICAL UN-ROTATION ---
+        # The model predicts in the agent-centric (rotated) frame. We must rotate the
+        # predicted relative steps back to the global map frame before integration.
+        V_pred_rel = V_pred[..., :2]
         
-        V_pred_rel_local = V_pred[..., :2]
-        V_pred_abs_local_mu = torch.cumsum(V_pred_rel_local, dim=1)
+        # theta is shape [Batch, Nodes]. Reshape for broadcasting [Batch, 1, Nodes, 1]
+        cos_th = torch.cos(theta).unsqueeze(1).unsqueeze(-1)
+        sin_th = torch.sin(theta).unsqueeze(1).unsqueeze(-1)
+
+        dx = V_pred_rel[..., 0:1]
+        dy = V_pred_rel[..., 1:2]
+
+        # Inverse rotation matrix (rotate by +theta)
+        unrot_dx = dx * cos_th - dy * sin_th
+        unrot_dy = dx * sin_th + dy * cos_th
+        V_pred_rel_global = torch.cat([unrot_dx, unrot_dy], dim=-1)
+
+        # --- INTEGRATE TO ABSOLUTE FOR LOSS ---
+        V_pred_cumsum = torch.cumsum(V_pred_rel_global, dim=1)
+        last_obs = obs_traj[:, :, :, -1].unsqueeze(1) # [Batch, 1, Nodes, 2]
+        V_pred_abs_mu = V_pred_cumsum + last_obs
         
-        # Reattach the sigmas and correlation (All remain in the local frame)
-        V_pred_abs_local = torch.cat([V_pred_abs_local_mu, V_pred[..., 2:]], dim=-1)
+        # Reattach sigmas 
+        V_pred_abs = torch.cat([V_pred_abs_mu, V_pred[..., 2:]], dim=-1)
         
-        # Get Ground Truth Relative offsets (already local from dataloader)
-        V_tr_rel_local = pred_traj_gt_rel.permute(0, 3, 1, 2)
-        
-        # Integrate to get local absolute target 
-        # (Origin is 0,0 at last_obs, so we don't need to add last_obs here)
-        V_tr_abs_local = torch.cumsum(V_tr_rel_local, dim=1)
+        # Target is absolute global
+        V_tr_abs = pred_traj_gt.permute(0, 3, 1, 2)
         
         mask_perm = loss_mask.permute(0, 2, 1)
         mask_perm = mask_perm[:, -args.pred_seq_len:, :]
         
-        # Calculate loss on Local Absolute Paths
-        loss = graph_loss(V_pred_abs_local, V_tr_abs_local, mask_perm, use_mse=use_mse)
+        loss = graph_loss(V_pred_abs, V_tr_abs, mask_perm, use_mse=use_mse)
 
         
         # Check for NaN
@@ -354,29 +363,28 @@ def vald(epoch, model, loader_val, metrics, constant_metrics):
             # Pass abs_coords to the model
             V_pred, _ = model(V_obs_tmp, A_obs, abs_coords, model_metadata)
             V_pred = V_pred.permute(0, 2, 3, 1)
-            # 4. Loss
-            # V_pred outputs RELATIVE offsets in the CANONICAL (local) frame.
-            # Its sigmas/rho are also local (Forward/Lateral variance).
-            # We MUST compute the loss in this local frame so the covariance aligns!
+            # --- CANONICAL UN-ROTATION ---
+            V_pred_rel = V_pred[..., :2]
+            cos_th = torch.cos(theta).unsqueeze(1).unsqueeze(-1)
+            sin_th = torch.sin(theta).unsqueeze(1).unsqueeze(-1)
+            dx = V_pred_rel[..., 0:1]
+            dy = V_pred_rel[..., 1:2]
             
-            V_pred_rel_local = V_pred[..., :2]
-            V_pred_abs_local_mu = torch.cumsum(V_pred_rel_local, dim=1)
+            unrot_dx = dx * cos_th - dy * sin_th
+            unrot_dy = dx * sin_th + dy * cos_th
+            V_pred_rel_global = torch.cat([unrot_dx, unrot_dy], dim=-1)
+
+            V_pred_cumsum = torch.cumsum(V_pred_rel_global, dim=1)
+            last_obs = obs_traj[:, :, :, -1].unsqueeze(1) 
+            V_pred_abs_mu = V_pred_cumsum + last_obs
             
-            # Reattach the sigmas and correlation (All remain in the local frame)
-            V_pred_abs_local = torch.cat([V_pred_abs_local_mu, V_pred[..., 2:]], dim=-1)
-            
-            # Get Ground Truth Relative offsets (already local from dataloader)
-            V_tr_rel_local = pred_traj_gt_rel.permute(0, 3, 1, 2)
-            
-            # Integrate to get local absolute target 
-            # (Origin is 0,0 at last_obs, so we don't need to add last_obs here)
-            V_tr_abs_local = torch.cumsum(V_tr_rel_local, dim=1)
+            V_pred_abs = torch.cat([V_pred_abs_mu, V_pred[..., 2:]], dim=-1)
+            V_tr_abs = pred_traj_gt.permute(0, 3, 1, 2)
             
             mask_perm = loss_mask.permute(0, 2, 1)
             mask_perm = mask_perm[:, -args.pred_seq_len:, :]
             
-            # Calculate loss on Local Absolute Paths
-            loss = graph_loss(V_pred_abs_local, V_tr_abs_local, mask_perm, use_mse=use_mse)
+            loss = graph_loss(V_pred_abs, V_tr_abs, mask_perm, use_mse=use_mse)
 
             loss_batch += loss.item()
             pbar.set_postfix({'Loss': loss_batch / (cnt + 1)})
@@ -602,15 +610,15 @@ if __name__ == '__main__':
         
         curr_val_loss = metrics['val_loss'][-1] if len(metrics['val_loss']) > 0 else float('inf')
         
-        # Use Loss as primary metric for best model unless you want ADE
-        # save_metric = curr_val_loss 
-        save_metric = metrics['ade'][-1] # Uncomment to save based on ADE
+        # Always check and save the best model at every epoch
+        # Using ADE as the primary metric for saving the best model
+        save_metric = metrics['ade'][-1] if len(metrics['ade']) > 0 else curr_val_loss
         
         if save_metric < best_val_loss:
             best_val_loss = save_metric
             best_model_state = model.state_dict() 
             torch.save(checkpoint, os.path.join(checkpoint_dir, 'best_model.pth'))
-            print(f"New Best Model Saved! ADE: {save_metric:.4f}")
+            print(f"New Best Model Saved! Metric: {save_metric:.4f}")
 
         with open(os.path.join(checkpoint_dir, 'metrics.pkl'), 'wb') as fp:
             pickle.dump(metrics, fp)
