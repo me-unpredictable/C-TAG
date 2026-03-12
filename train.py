@@ -504,13 +504,14 @@ if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = CTAG(
+        threshold=args.thres,
         n_gcnn=args.n_gcnn,
         n_tcnn=args.n_tcnn,
+        input_feat=args.input_size,
         output_feat=args.output_size,
         seq_len=args.obs_seq_len,
         kernel_size=args.kernel_size,
-        pred_seq_len=args.pred_seq_len,
-        threshold=args.thres
+        pred_seq_len=args.pred_seq_len
     ).to(device)
     # Optimizer and Scheduler
     # optimizer = optim.SGD(model.parameters(), lr=args.lr)

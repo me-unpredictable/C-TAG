@@ -300,8 +300,8 @@ class TrajectoryDataset(Dataset):
             curr_seq_data = np.concatenate(frame_data[idx:idx + self.seq_len], axis=0)
             peds_in_curr_seq = np.unique(curr_seq_data[:, 1])
             
-            # [FIXED] Reverted back to 2 channels for Canonical Rotation
-            curr_seq_rel = np.zeros((len(peds_in_curr_seq), 2, self.seq_len))
+            # [FIXED] Updated to 4 channels for Global Compass
+            curr_seq_rel = np.zeros((len(peds_in_curr_seq), 4, self.seq_len))
             curr_seq = np.zeros((len(peds_in_curr_seq), 2, self.seq_len))
             curr_loss_mask = np.zeros((len(peds_in_curr_seq), self.seq_len))
             curr_theta = np.zeros(len(peds_in_curr_seq)) # [NEW] Track angle for this specific scene segment
@@ -398,10 +398,12 @@ class TrajectoryDataset(Dataset):
                 rot_dx = dx * cos_th - dy * sin_th
                 rot_dy = dx * sin_th + dy * cos_th
                 
-                # Assign back to standard 2-channel tensor
-                rel_curr_obj_seq = np.zeros((2, self.seq_len))
+                # Assign to 4-channel tensor: [rot_dx, rot_dy, cos(theta), sin(theta)]
+                rel_curr_obj_seq = np.zeros((4, self.seq_len))
                 rel_curr_obj_seq[0, 1:] = rot_dx
                 rel_curr_obj_seq[1, 1:] = rot_dy
+                rel_curr_obj_seq[2, :] = np.cos(theta)
+                rel_curr_obj_seq[3, :] = np.sin(theta)
                 # ------------------------------------------------
 
                 _idx = num_peds_considered

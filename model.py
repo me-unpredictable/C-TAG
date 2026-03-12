@@ -268,7 +268,7 @@ class VSIE(nn.Module):
             # Check if likely in [B, C, T, V] format
             # We assume C is smaller than T or V typically, or match self.in_feat logic
             # If x.size(1) is small (channels), permute.
-            if x.size(1) == self.in_feat or x.size(1) == 2: 
+            if x.size(1) == self.in_feat or x.size(1) in [2, 4]: 
                  x = x.permute(0, 2, 3, 1) # [B, T, V, C]
 
         # Auto-pad features if input is 2D (dx, dy) but model expects 4D (dx, dy, v, theta)
