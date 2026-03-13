@@ -46,6 +46,7 @@ parser.add_argument('--shuffle', action="store_true", default=False, help='Wheth
 parser.add_argument('--reload_data', action="store_true", default=False, help='Whether to reload the data from all files')
 parser.add_argument('--dataset_path', type=str, required=True, help='Path to the raw dataset directory')
 parser.add_argument('--skip_val', action="store_true", default=False, help='Whether to skip validation during training')
+parser.add_argument('--save_all', action="store_true", default=False, help='Whether to save all models during training')
 parser.add_argument('--log_dir', type=str, default="./logs", help='Directory to save logs')
 parser.add_argument('--n_splits', type=int, default=1, help='Number of splits (Deprecated)')
 
@@ -301,7 +302,8 @@ for epoch in range(args.num_epochs):
     print('*'*30)
 
     # Save Checkpoints
-    torch.save(model.state_dict(), os.path.join(checkpoint_dir, f'model_epoch{epoch}.pth'))
+    if args.save_all:
+        torch.save(model.state_dict(), os.path.join(checkpoint_dir, f'model_epoch{epoch}.pth'))
     
     curr_val_loss = metrics['val_loss'][-1] if len(metrics['val_loss']) > 0 else float('inf')
     if curr_val_loss < best_val_loss:

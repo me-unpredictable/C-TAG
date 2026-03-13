@@ -12,6 +12,7 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
 import seaborn as sns
+import matplotlib.cm as cm
 
 # Import your modules
 from model import CTAG
@@ -81,7 +82,7 @@ def evaluate(model, loader, args, num_samples=20):
                  # Maintain backward compatibility if theta is missing
                  obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr = batch_tensors
                  theta = None
-            
+
             batch_tensors = [t.cuda() for t in batch_tensors if torch.is_tensor(t)]
             # Fix: Ensure all tensors are on CUDA, unpacking correctly after potentially stripping non-tensors
             # Wait, list comprehension above returns a new list. We need to unpack THIS list.
@@ -89,6 +90,9 @@ def evaluate(model, loader, args, num_samples=20):
                  obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr, theta = batch_tensors
             else:
                  obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr = batch_tensors
+            
+            # Ensure specific tensors are on cuda (redundant but safe)
+            obs_traj = obs_traj.cuda()
             
             V_obs_tmp = V_obs.permute(0, 3, 1, 2) 
             # NEW: Prepare Absolute Coordinates
@@ -127,19 +131,16 @@ def evaluate(model, loader, args, num_samples=20):
             
             batch_size = V_pred.shape[0]
             V_pred_np = V_pred_abs.cpu().numpy()
-            V_pred_params_np = V_pred.cpu().numpy()
             V_tr_np = V_tr_abs.cpu().numpy()
             obs_traj_np = obs_traj_abs.cpu().numpy()
             loss_mask_np = loss_mask.cpu().numpy()
+            V_pred_params_np = V_pred.cpu().numpy()
+            theta_np = theta.cpu().numpy() if theta is not None else None
 
             pred_list = []
             target_list = []
             count_list = []
 
-            # Un-rotate samples
-            if theta is not None:
-                theta_np = theta.cpu().numpy()
-            
             for i in range(batch_size):
                 meta_id, orig_w, orig_h = batch_metadata[i]
                 unscale_x = orig_w / 512.0
@@ -168,12 +169,12 @@ def evaluate(model, loader, args, num_samples=20):
                     ped_pred = p_i[:, ped_idx, :]
                     ped_gt = t_i[:, ped_idx, :]
                     ped_obs = o_i[:, ped_idx, :]
-
+                    
                     ped_ade = np.mean(np.linalg.norm(ped_pred - ped_gt, axis=-1))
-
+                    
                     # Track physical movement distance to filter out stationary people
                     displacement = np.linalg.norm(ped_gt[-1] - ped_obs[0])
-
+                    
                     params = V_pred_params_np[i, :, ped_idx, :]
                     mu = params[:, :2]
                     log_sx = np.clip(params[:, 2], -20.0, 6.0)
@@ -192,7 +193,7 @@ def evaluate(model, loader, args, num_samples=20):
                         sample_rel[:, t, :] = np.random.multivariate_normal(mu[t], cov, size=num_samples)
 
                     # --- UNROTATE SAMPLES TO GLOBAL FRAME ---
-                    if theta is not None:
+                    if theta_np is not None:
                         th = theta_np[i, ped_idx]
                         cos_th_val = np.cos(th)
                         sin_th_val = np.sin(th)
@@ -207,7 +208,7 @@ def evaluate(model, loader, args, num_samples=20):
                     sample_abs = np.cumsum(sample_rel, axis=1) + last_obs[None, None, :]
                     sample_abs[..., 0] *= unscale_x
                     sample_abs[..., 1] *= unscale_y
-
+                    
                     ped_trajectories.append({
                         'ade': ped_ade,
                         'obs': ped_obs,
@@ -227,162 +228,227 @@ def evaluate(model, loader, args, num_samples=20):
     
     return ped_trajectories
 
-def plot_top_5_trajectories(ped_trajectories, data_dir, no_map=False, heat=False):
-    # Filter out people who moved less than 15 pixels overall
-    moving_trajectories = [t for t in ped_trajectories if t['displacement'] > 15.0]
+
+import tkinter as tk
+from tkinter import filedialog
+from matplotlib.widgets import Slider, Button
+
+def draw_interactive_trajectory(traj, heat, no_map, title_text):
+    fig, ax = plt.subplots(figsize=(10, 8))
     
+    # Extract data
+    obs = traj['obs']
+    pred_orig = traj['pred']
+    gt = traj['gt']
+    pred_samples = traj['pred_samples']
+    meta_id = traj.get('meta_id')
+
+    # Reconstruct the plottable "pred" line by picking the sample closest to GT at each timestep
+    pred = np.zeros_like(gt)
+    for t in range(gt.shape[0]):
+        dists = np.linalg.norm(pred_samples[:, t, :] - gt[t], axis=-1)
+        best_idx = np.argmin(dists)
+        pred[t] = pred_samples[best_idx, t, :]
+    
+    sample_dists = np.mean(np.linalg.norm(pred_samples - np.expand_dims(gt, axis=0), axis=-1), axis=1)
+    best_overall_idx = np.argmin(sample_dists)
+    best_sample_traj = pred_samples[best_overall_idx, :, :]
+    
+    map_img_path = None
+    if meta_id:
+        map_img_name = meta_id.replace('_map.pt', '.jpg')
+        map_img_path = os.path.join('./processed/maps', map_img_name)
+        if not os.path.exists(map_img_path):
+            map_img_path = None
+
+    state = {
+        'map_img_path': map_img_path,
+        'bw': 0.7,
+        'tau': 1.3, 
+        'thresh': 0.05,
+        'show_lines': False,
+        'show_best_sample': False,
+        'show_legend': True
+    }
+
+    plt.subplots_adjust(bottom=0.25)
+
+    def draw():
+        ax.clear()
+        ax.axis('equal')
+        
+        if state['map_img_path'] and not no_map:
+            try:
+                img = mpimg.imread(state['map_img_path'])
+                ax.imshow(img, extent=[0, img.shape[1], img.shape[0], 0])
+                ax.set_xlim(0, img.shape[1])
+                ax.set_ylim(img.shape[0], 0)
+            except Exception as e:
+                print(f"Could not load map: {e}")
+        else:
+            ax.grid(True, linestyle='--', alpha=0.6)
+            all_x = np.concatenate([obs[:, 0], gt[:, 0], pred[:, 0]])
+            all_y = np.concatenate([obs[:, 1], gt[:, 1], pred[:, 1]])
+            cx, cy = np.mean(all_x), np.mean(all_y)
+            window = 100 
+            ax.set_xlim(cx - window, cx + window)
+            ax.set_ylim(cy - window, cy + window) 
+
+        ax.plot(obs[:, 0], obs[:, 1], color='blue', marker='o', linestyle='-', linewidth=2, label='Observed History', markersize=4)
+        ax.plot(gt[:, 0], gt[:, 1], color='green', marker='s', linestyle='-', linewidth=2, label='Ground Truth Future', markersize=4)
+        ax.plot([obs[-1, 0], gt[0, 0]], [obs[-1, 1], gt[0, 1]], color='green', linestyle='-', linewidth=2)
+        
+        if heat:
+            import seaborn as sns
+            all_x = pred_samples[:, :, 0].flatten()
+            all_y = pred_samples[:, :, 1].flatten()
+            
+            dist_to_gt = np.linalg.norm(pred_samples - np.expand_dims(gt, axis=0), axis=-1)
+            tau_val = (np.mean(dist_to_gt) + 1e-5) * state['tau']
+            weights = np.exp(-dist_to_gt / tau_val).flatten()
+            
+            # Using thresh prevents small spills (values below a density threshold aren't drawn)
+            sns.kdeplot(x=all_x, y=all_y, weights=weights, cmap='Reds', fill=True, alpha=0.5, 
+                        bw_adjust=state['bw'], levels=100, thresh=state['thresh'], ax=ax)
+            ax.plot([], [], color='red', linestyle='--',linewidth=1.5, label='Predicted Trajectories (Distribution)', alpha=0.5)
+
+            if state.get('show_lines', False):
+                ax.plot(pred[:, 0], pred[:, 1], color='orange', marker='X', linestyle='-', linewidth=2.5, markersize=6)
+                ax.plot([obs[-1, 0], pred[0, 0]], [obs[-1, 1], pred[0, 1]], color='orange', linestyle='-', linewidth=2)
+            
+            if state.get('show_best_sample', False):
+                ax.plot(best_sample_traj[:, 0], best_sample_traj[:, 1], color='darkred', marker='p', linestyle='solid', linewidth=2.5, markersize=5)
+                ax.plot([obs[-1, 0], best_sample_traj[0, 0]], [obs[-1, 1], best_sample_traj[0, 1]], color='darkred', linestyle='solid', linewidth=2.5)
+                
+        else:
+            colors = cm.Reds(np.linspace(0.4, 1.0, pred_samples.shape[0]))
+            for s_idx in range(pred_samples.shape[0]):
+                label = 'Predicted samples' if s_idx == 0 else None
+                ax.plot(pred_samples[s_idx, :, 0], pred_samples[s_idx, :, 1], color=colors[s_idx], marker='*', markersize=2, linestyle='--', linewidth=1, alpha=0.6, label=label)
+                ax.plot([obs[-1, 0], pred_samples[s_idx, 0, 0]], [obs[-1, 1], pred_samples[s_idx, 0, 1]], color=colors[s_idx], linestyle='--', linewidth=1, alpha=0.6)
+                
+            ax.plot(pred[:, 0], pred[:, 1], color='darkred', marker='*', linestyle='-', linewidth=2.5, label='Best Mean Prediction', markersize=6)
+            ax.plot([obs[-1, 0], pred[0, 0]], [obs[-1, 1], pred[0, 1]], color='darkred', linestyle='-', linewidth=2)
+
+        ax.set_title(title_text)
+        if state.get('show_legend', True):
+            ax.legend(loc='best')
+        ax.set_xlabel("X Coordinate (Pixels)")
+        ax.set_ylabel("Y Coordinate (Pixels)")
+        fig.canvas.draw_idle()
+
+    draw()
+
+    # UI Elements
+    axcolor = 'lightgoldenrodyellow'
+    
+    if heat:
+        ax_bw = plt.axes([0.25, 0.1, 0.65, 0.03], facecolor=axcolor)
+        ax_tau = plt.axes([0.25, 0.05, 0.65, 0.03], facecolor=axcolor)
+        ax_thresh = plt.axes([0.25, 0.15, 0.65, 0.03], facecolor=axcolor)
+        
+        s_bw = Slider(ax_bw, 'Spread', 0.1, 2.0, valinit=0.5)
+        s_tau = Slider(ax_tau, 'Weight Decay', 0.1, 5.0, valinit=1.0)
+        s_thresh = Slider(ax_thresh, 'Min Heatmap Thresh', 0.01, 0.5, valinit=0.05)
+        
+        def update(val):
+            state['bw'] = s_bw.val
+            state['tau'] = s_tau.val
+            state['thresh'] = s_thresh.val
+            draw()
+            
+        s_bw.on_changed(update)
+        s_tau.on_changed(update)
+        s_thresh.on_changed(update)
+
+        ax_btn_lines = plt.axes([0.05, 0.12, 0.15, 0.05])
+        btn_lines = Button(ax_btn_lines, 'Toggle Lines', color=axcolor, hovercolor='0.975')
+        
+        def toggle_lines(event):
+            state['show_lines'] = not state['show_lines']
+            draw()
+            
+        btn_lines.on_clicked(toggle_lines)
+        
+        ax_btn_best = plt.axes([0.05, 0.19, 0.15, 0.05])
+        btn_best = Button(ax_btn_best, 'Toggle Best Sample', color=axcolor, hovercolor='0.975')
+        
+        def toggle_best_sample(event):
+            state['show_best_sample'] = not state['show_best_sample']
+            draw()
+            
+        btn_best.on_clicked(toggle_best_sample)
+
+    ax_btn = plt.axes([0.05, 0.05, 0.15, 0.05])
+    btn = Button(ax_btn, 'Toggle Legend', color=axcolor, hovercolor='0.975')
+    
+    def toggle_legend(event):
+        state['show_legend'] = not state['show_legend']
+        draw()
+
+    btn.on_clicked(toggle_legend)
+    plt.show()
+
+def is_turn_trajectory(traj_dict, deviation_threshold=3.5):
+    gt = traj_dict['gt']
+    
+    start = gt[0]
+    end = gt[-1]
+    
+    line_vec = end - start
+    line_len = np.linalg.norm(line_vec)
+    if line_len < 1e-3:
+        return False
+    
+    line_unit = line_vec / line_len
+    
+    # Calculate deviation of the future trajectory (gt) from the straight line between its start and end
+    vecs = gt - start
+    projs = np.sum(vecs * line_unit, axis=1)
+    proj_pts = start + projs[:, None] * line_unit[None, :]
+    
+    # max distance between ground truth points and the projected points on the straight line
+    max_dev = np.max(np.linalg.norm(gt - proj_pts, axis=1))
+    
+    return max_dev > deviation_threshold
+
+def plot_top_5_trajectories(ped_trajectories, data_dir, no_map=False, heat=False, turn_only=False):
+    if turn_only:
+        moving_trajectories = [t for t in ped_trajectories if t['displacement'] > 15.0 and is_turn_trajectory(t)]
+    else:
+        moving_trajectories = [t for t in ped_trajectories if t['displacement'] > 15.0]
     if len(moving_trajectories) >= 5:
         trajectories_to_plot = moving_trajectories
-        print("\nFiltered out stationary agents (displacement < 15px) for clearer visualization.")
     else:
         trajectories_to_plot = ped_trajectories
-        print("\nNot enough moving agents found. Showing best available agents.")
-
     trajectories_to_plot.sort(key=lambda x: x['ade'])
     top_5 = trajectories_to_plot[:5]
 
-    print("\nVisualizing the Top 5 Moving Predictions (Lowest ADE)...")
     for idx, traj in enumerate(top_5):
-        plt.figure(figsize=(10, 8))
-        
-        # Enforce True Aspect Ratio (1 pixel X = 1 pixel Y)
-        plt.axis('equal')
-        
-        meta_id = traj.get('meta_id')
-        map_img_path = None
-        if meta_id:
-            map_img_name = meta_id.replace('_map.pt', '.jpg')
-            map_img_path = os.path.join('./processed/maps', map_img_name)
-            if not os.path.exists(map_img_path):
-                map_img_path = None
-        
-        obs = traj['obs']
-        gt = traj['gt']
-        pred_samples = traj.get('pred_samples')
-        if pred_samples is None:
-            pred_samples = np.expand_dims(traj['pred'], axis=0)
-        sample_colors = plt.get_cmap('tab20', pred_samples.shape[0])
-        
-        plt.plot(obs[:, 0], obs[:, 1], color='blue', marker='o', linestyle='-', linewidth=2, label='Observed History', markersize=4)
-        plt.plot(gt[:, 0], gt[:, 1], color='green', marker='s', linestyle='-', linewidth=2, label='Ground Truth Future', markersize=4)
-        
-        if heat:
-            sample_points = pred_samples.reshape(-1, 2)
-            sns.kdeplot(x=sample_points[:, 0], y=sample_points[:, 1], fill=True, alpha=0.3, cmap="Reds", thresh=0.01, levels=10, cut=0)
+        title_text = f"Rank {idx+1} - Best Moving Prediction | ADE: {traj['ade']:.4f}"
+        draw_interactive_trajectory(traj, heat, no_map, title_text)
 
-        for s_idx in range(pred_samples.shape[0]):
-            color = sample_colors(s_idx)
-            label = 'Predicted Samples' if s_idx == 0 else None
-            plt.plot(pred_samples[s_idx, :, 0], pred_samples[s_idx, :, 1], color=color, linestyle='--', linewidth=1.5, label=label, alpha=0.15 if heat else 0.85)
-        
-        plt.plot([obs[-1, 0], gt[0, 0]], [obs[-1, 1], gt[0, 1]], color='green', linestyle='-', linewidth=2)
-        for s_idx in range(pred_samples.shape[0]):
-            color = sample_colors(s_idx)
-            plt.plot([obs[-1, 0], pred_samples[s_idx, 0, 0]], [obs[-1, 1], pred_samples[s_idx, 0, 1]], color=color, linestyle='--', linewidth=1, alpha=0.15 if heat else 1.0)
-        
-        if map_img_path and not no_map:
-            img = mpimg.imread(map_img_path)
-            # Load Map and Align with standard image coordinates (Y=0 at Top)
-            plt.imshow(img, extent=[0, img.shape[1], img.shape[0], 0])
-            plt.xlim(0, img.shape[1])
-            plt.ylim(img.shape[0], 0) # Inverted Y for image
-        else:
-            plt.grid(True, linestyle='--', alpha=0.6)
-            # Determine the center of the trajectory and create a fixed 150-pixel viewing window
-            all_x = np.concatenate([obs[:, 0], gt[:, 0], pred_samples.reshape(-1, 2)[:, 0]])
-            all_y = np.concatenate([obs[:, 1], gt[:, 1], pred_samples.reshape(-1, 2)[:, 1]])
-            cx, cy = np.mean(all_x), np.mean(all_y)
-            window = 100 
-            plt.xlim(cx - window, cx + window)
-            plt.ylim(cy - window, cy + window) 
-
-        plt.title(f"Rank {idx+1} - Best Moving Prediction | ADE: {traj['ade']:.4f}")
-        plt.legend(loc='best')
-        plt.xlabel("X Coordinate (Pixels)")
-        plt.ylabel("Y Coordinate (Pixels)")
-        
-        plt.show()
-
-def plot_bottom_5_trajectories(ped_trajectories, data_dir, no_map=False, heat=False):
-    # Filter out people who moved less than 15 pixels overall
-    moving_trajectories = [t for t in ped_trajectories if t['displacement'] > 15.0]
-    
+def plot_bottom_5_trajectories(ped_trajectories, data_dir, no_map=False, heat=False, turn_only=False):
+    if turn_only:
+        moving_trajectories = [t for t in ped_trajectories if t['displacement'] > 15.0 and is_turn_trajectory(t)]
+    else:
+        moving_trajectories = [t for t in ped_trajectories if t['displacement'] > 15.0]
     if len(moving_trajectories) >= 5:
         trajectories_to_plot = moving_trajectories
-        print("\nFiltered out stationary agents (displacement < 15px) for clearer visualization.")
     else:
         trajectories_to_plot = ped_trajectories
-        print("\nNot enough moving agents found. Showing worst available agents.")
-
     trajectories_to_plot.sort(key=lambda x: x['ade'], reverse=True)
     bottom_5 = trajectories_to_plot[:5]
 
-    print("\nVisualizing the Bottom 5 Moving Predictions (Highest ADE)...")
     for idx, traj in enumerate(bottom_5):
-        plt.figure(figsize=(10, 8))
-        
-        # Enforce True Aspect Ratio (1 pixel X = 1 pixel Y)
-        plt.axis('equal')
-        
-        meta_id = traj.get('meta_id')
-        map_img_path = None
-        if meta_id:
-            map_img_name = meta_id.replace('_map.pt', '.jpg')
-            map_img_path = os.path.join('./processed/maps', map_img_name)
-            if not os.path.exists(map_img_path):
-                map_img_path = None
-        
-        obs = traj['obs']
-        gt = traj['gt']
-        pred_samples = traj.get('pred_samples')
-        if pred_samples is None:
-            pred_samples = np.expand_dims(traj['pred'], axis=0)
-        sample_colors = plt.get_cmap('tab20', pred_samples.shape[0])
-        
-        plt.plot(obs[:, 0], obs[:, 1], color='blue', marker='o', linestyle='-', linewidth=2, label='Observed History', markersize=4)
-        plt.plot(gt[:, 0], gt[:, 1], color='green', marker='s', linestyle='-', linewidth=2, label='Ground Truth Future', markersize=4)
-        
-        if heat:
-            sample_points = pred_samples.reshape(-1, 2)
-            sns.kdeplot(x=sample_points[:, 0], y=sample_points[:, 1], fill=True, alpha=0.3, cmap="Reds", thresh=0.01, levels=10, cut=0)
-
-        for s_idx in range(pred_samples.shape[0]):
-            color = sample_colors(s_idx)
-            label = 'Predicted Samples' if s_idx == 0 else None
-            plt.plot(pred_samples[s_idx, :, 0], pred_samples[s_idx, :, 1], color=color, linestyle='--', linewidth=1.5, label=label, alpha=0.15 if heat else 0.85)
-        
-        plt.plot([obs[-1, 0], gt[0, 0]], [obs[-1, 1], gt[0, 1]], color='green', linestyle='-', linewidth=2)
-        for s_idx in range(pred_samples.shape[0]):
-            color = sample_colors(s_idx)
-            plt.plot([obs[-1, 0], pred_samples[s_idx, 0, 0]], [obs[-1, 1], pred_samples[s_idx, 0, 1]], color=color, linestyle='--', linewidth=1, alpha=0.15 if heat else 1.0)
-        
-        if map_img_path and not no_map:
-            img = mpimg.imread(map_img_path)
-            # Load Map and Align with standard image coordinates (Y=0 at Top)
-            plt.imshow(img, extent=[0, img.shape[1], img.shape[0], 0])
-            plt.xlim(0, img.shape[1])
-            plt.ylim(img.shape[0], 0) # Inverted Y for image
-        else:
-            plt.grid(True, linestyle='--', alpha=0.6)
-            # Determine the center of the trajectory and create a fixed 150-pixel viewing window
-            all_x = np.concatenate([obs[:, 0], gt[:, 0], pred_samples.reshape(-1, 2)[:, 0]])
-            all_y = np.concatenate([obs[:, 1], gt[:, 1], pred_samples.reshape(-1, 2)[:, 1]])
-            cx, cy = np.mean(all_x), np.mean(all_y)
-            window = 100 
-            plt.xlim(cx - window, cx + window)
-            plt.ylim(cy - window, cy + window) 
-
-        plt.title(f"Rank {idx+1} - Worst Moving Prediction | ADE: {traj['ade']:.4f}")
-        plt.legend(loc='best')
-        plt.xlabel("X Coordinate (Pixels)")
-        plt.ylabel("Y Coordinate (Pixels)")
-        
-        plt.show()
+        title_text = f"Rank {idx+1} - Worst Moving Prediction | ADE: {traj['ade']:.4f}"
+        draw_interactive_trajectory(traj, heat, no_map, title_text)
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--no_map', action='store_true', help='Disable map and show only close up of trajectories')
-    parser.add_argument('--heat', action='store_true', help='Show heatmap for predicted trajectories')
+    parser.add_argument('--heat', action='store_true', help='Show heatmap mapped over predictions')
+    parser.add_argument('--turn', action='store_true', help='Focus only on trajectories with turns')
     cmd_args = parser.parse_args()
 
     model_path, args_path = get_model_path()
@@ -447,7 +513,7 @@ def main():
     ped_trajectories = evaluate(model, loader_test, args, num_samples=20)
     
     if ped_trajectories:
-        plot_top_5_trajectories(ped_trajectories, test_data_dir, no_map=cmd_args.no_map, heat=cmd_args.heat)
-        plot_bottom_5_trajectories(ped_trajectories, test_data_dir, no_map=cmd_args.no_map, heat=cmd_args.heat)
+        plot_top_5_trajectories(ped_trajectories, test_data_dir, no_map=cmd_args.no_map, heat=cmd_args.heat, turn_only=cmd_args.turn)
+        plot_bottom_5_trajectories(ped_trajectories, test_data_dir, no_map=cmd_args.no_map, heat=cmd_args.heat, turn_only=cmd_args.turn)
 if __name__ == '__main__':
     main()

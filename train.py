@@ -82,7 +82,7 @@ parser.add_argument('--scene_name', default='bookstore', help='Scene name to tra
 # Training specific parameters
 parser.add_argument('--batch_size', type=int, default=64, help='minibatch size (Virtual Batch Size for Gradient Accumulation)')
 parser.add_argument('--num_epochs', type=int, default=150, help='number of epochs')
-parser.add_argument('--clip_grad', type=float, default=None, help='gradient clipping')
+parser.add_argument('--clip_grad', type=float, default=1.0, help='gradient clipping')
 parser.add_argument('--lr', type=float, default=0.1, help='learning rate')
 parser.add_argument('--lr_sh_rate', type=int, default=75, help='number of steps to drop the lr')
 parser.add_argument('--use_lrschd', action="store_true", default=True, help='Use lr rate scheduler')
@@ -570,7 +570,30 @@ if __name__ == '__main__':
                 if len(metrics['train_loss']) > 0 and np.isnan(metrics['train_loss'][-1]):
                     print("NaN loss detected.")
 
-        # --- Early Stopping Logic ---
+        # --- Early Stopping/NaN Logic ---
+        # NaN Handling: If train_loss or val_loss is NaN/Inf, reduce LR
+        # If already at minimum LR, stop training.
+
+        has_nan = False
+        if len(metrics['train_loss']) > 0 and (np.isnan(metrics['train_loss'][-1]) or np.isinf(metrics['train_loss'][-1])):
+            has_nan = True
+        if len(metrics['val_loss']) > 0 and (np.isnan(metrics['val_loss'][-1]) or np.isinf(metrics['val_loss'][-1])):
+            has_nan = True
+
+        if has_nan:
+            print("*" * 50)
+            print(" [WARNING] NaN or Inf detected in loss.")
+            if optimizer.param_groups[0]['lr'] <= min_lr_threshold:
+                 print(f" [EarlyStopping] LR is at min ({optimizer.param_groups[0]['lr']:.6f}) and NaN detected. Terminating training.")
+                 break
+            else:
+                 new_lr = max(1e-5, optimizer.param_groups[0]['lr'] * 0.1)
+                 for param_group in optimizer.param_groups:
+                     param_group['lr'] = new_lr
+                 print(f" [EarlyStopping] Dropping LR to {new_lr:.6f} due to NaN.")
+                 print("*" * 50)
+                 continue # Proceed to next epoch without evaluating early stopping counts
+
         # 1. Check if we are at the lowest LR
         if optimizer.param_groups[0]['lr'] <= min_lr_threshold:
              # Check improvement against the best observed loss so far

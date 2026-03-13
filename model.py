@@ -315,7 +315,7 @@ class VSIE(nn.Module):
         K_batched = K.view(b, t * n, -1) 
         v_batched = v.view(b, t * n, -1) 
         
-        attn_scores = torch.bmm(Q_batched, K_batched.transpose(1, 2))
+        attn_scores = torch.bmm(Q_batched, K_batched.transpose(1, 2)) / math.sqrt(q_dim)
         attn_probs = Func.sigmoid(attn_scores)
         out_batched = torch.bmm(attn_probs, v_batched)
         

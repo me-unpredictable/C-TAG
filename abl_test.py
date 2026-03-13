@@ -183,34 +183,14 @@ def evaluate(model, loader, args, map_type='default'):
 
     final_ade = np.mean(ade_list)
     final_fde = np.mean(fde_list)
-    print(f"\nFinal Results for {map_type} Ablation:")
-    print(f"ADE: {final_ade:.4f}")
-    print(f"FDE: {final_fde:.4f}")
     
     # Restore monkey patch
     model.vsie.extract_local_context = original_extract
     
     return final_ade, final_fde
 
-def main():
-    parser = argparse.ArgumentParser(description="Evaluate C-TAG with Ablation settings.")
-    parser.add_argument('--bad_map', action='store_true', help='Use maps stored in processed/bad_maps directory')
-    parser.add_argument('--white_map', action='store_true', help='Use maps stored in processed/white_maps directory')
-    parser.add_argument('--no_map', action='store_true', help='Avoid using maps, substitute with zero tensor in VSIE')
-    
-    cmd_args = parser.parse_args()
 
-    # Determine map_type
-    map_type = 'normal_map'
-    if cmd_args.bad_map:
-        map_type = 'bad_map'
-    if cmd_args.white_map:
-        map_type = 'white_map'
-    if cmd_args.no_map:
-        map_type = 'no_map'
-        
-    model_path, args_path = get_model_path()
-    
+def run_evaluation_for_model(model_path, args_path):
     with open(args_path, 'rb') as f:
         args = pickle.load(f)
         
@@ -227,7 +207,6 @@ def main():
             scene_name = checkpoint['scene_name']
     
     test_data_dir = os.path.join('./processed/test', str(scene_name) if scene_name else '')
-    
     if not os.path.exists(test_data_dir):
         if os.path.exists('./processed/test'):
              test_data_dir = './processed/test'
@@ -266,29 +245,82 @@ def main():
         model.load_state_dict(state_dict)
     except RuntimeError as e:
         print(f"Error loading state dict: {e}")
-        sys.exit(1)
+        return
         
-    # Store results to file system
     results_dir = os.path.join('test_bed')
     if not os.path.exists(results_dir):
         os.makedirs(results_dir)
-        
-    ade_val, fde_val = evaluate(model, loader_test, args, map_type=map_type)
+
+    map_types = ['normal_map', 'bad_map', 'white_map', 'no_map']
+    results = {}
+    
+    for mt in map_types:
+        ade_val, fde_val = evaluate(model, loader_test, args, map_type=mt)
+        results[mt] = (ade_val, fde_val)
     
     model_name = os.path.basename(os.path.dirname(model_path))
     scene_str = scene_name if scene_name else "All"
     
-    res_file = os.path.join(results_dir, "ablation_results.md")
-    write_header = not os.path.exists(res_file)
+    print("\n" + "="*50)
+    print(f"RESULTS FOR MODEL: {model_name}")
+    print(f"SCENE: {scene_str}")
+    print("="*50)
+    print(f"| {'Map Type':<15} | {'ADE':<10} | {'FDE':<10} |")
+    print("-" * 50)
+    for mt in map_types:
+        print(f"| {mt:<15} | {results[mt][0]:<10.4f} | {results[mt][1]:<10.4f} |")
+    print("="*50 + "\n")
     
-    with open(res_file, "a") as f:
-        if write_header:
+    res_file_md = os.path.join(results_dir, "ablation_results.md")
+    write_header_md = not os.path.exists(res_file_md)
+    
+    with open(res_file_md, "a") as f:
+        if write_header_md:
             f.write("# Ablation Study Results\n\n")
-            f.write("| Scene | Model Name | Map Type | ADE | FDE |\n")
-            f.write("|-------|------------|----------|-----|-----|\n")
-        f.write(f"| {scene_str} | {model_name} | {map_type} | {ade_val:.4f} | {fde_val:.4f} |\n")
+            f.write("| Scene | Model Name | Normal ADE | Normal FDE | Bad Map ADE | Bad Map FDE | White Map ADE | White Map FDE | Zero Map ADE | Zero Map FDE |\n")
+            f.write("|-------|------------|------------|------------|-------------|-------------|---------------|---------------|--------------|--------------|\n")
+        f.write(f"| {scene_str} | {model_name} | {results['normal_map'][0]:.4f} | {results['normal_map'][1]:.4f} | {results['bad_map'][0]:.4f} | {results['bad_map'][1]:.4f} | {results['white_map'][0]:.4f} | {results['white_map'][1]:.4f} | {results['no_map'][0]:.4f} | {results['no_map'][1]:.4f} |\n")
         
-    print(f"Results appended to {res_file}")
+    res_file_csv = os.path.join(results_dir, "ablation_results.csv")
+    write_header_csv = not os.path.exists(res_file_csv)
+    
+    with open(res_file_csv, "a") as f:
+        if write_header_csv:
+            f.write("Scene,Model Name,Normal_map ADE,Normal_map FDE,bad_map ADE,bad_map FDE,white_map ADE,white_map FDE,zero_map ADE,zero_map FDE\n")
+        f.write(f"{scene_str},{model_name},{results['normal_map'][0]:.4f},{results['normal_map'][1]:.4f},{results['bad_map'][0]:.4f},{results['bad_map'][1]:.4f},{results['white_map'][0]:.4f},{results['white_map'][1]:.4f},{results['no_map'][0]:.4f},{results['no_map'][1]:.4f}\n")
+        
+    print(f"Results appended to {res_file_md} and {res_file_csv}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Evaluate C-TAG with Ablation settings.")
+    parser.add_argument('--auto', action='store_true', help='Automatically run best models for all checkpoint dirs on all 4 map types')
+    cmd_args = parser.parse_args()
+
+    if cmd_args.auto:
+        checkpoint_root = './checkpoint/'
+        subdirs = [d for d in glob.glob(os.path.join(checkpoint_root, '*')) if os.path.isdir(d)]
+        subdirs.sort()
+        
+        for exp_dir in subdirs:
+            model_path = os.path.join(exp_dir, 'best_model.pth')
+            args_path = os.path.join(exp_dir, 'args.pkl')
+            
+            if not os.path.exists(model_path):
+                print(f"Skipping {exp_dir} (best_model.pth not found)")
+                continue
+            if not os.path.exists(args_path):
+                print(f"Skipping {exp_dir} (args.pkl not found)")
+                continue
+                
+            print(f"\n===========================")
+            print(f"Running auto evaluation: Model={os.path.basename(exp_dir)}")
+            print(f"===========================")
+            run_evaluation_for_model(model_path, args_path)
+                
+    else:
+        model_path, args_path = get_model_path()
+        run_evaluation_for_model(model_path, args_path)
 
 if __name__ == '__main__':
     main()
