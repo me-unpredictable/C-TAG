@@ -183,7 +183,7 @@ class VSIE(nn.Module):
         # --- C-TAG CAPACITY FIX ---
         # 1. Widen Compressor: 2048 -> 256 (Was 32)
         #    This preserves 8x more visual detail from the ResNet map.
-        self.compressor = nn.Conv2d(in_channels=2048, out_channels=256, kernel_size=1)
+        self.compressor = nn.Conv2d(in_channels=512, out_channels=256, kernel_size=1)
         
         # 2. Widen Fusion Layer: Input is Motion(in_feat*2) + Visual(256)
         self.visual_fusion = nn.Linear((in_feat*2) + 256, in_feat*2)

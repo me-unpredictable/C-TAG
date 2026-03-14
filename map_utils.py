@@ -29,10 +29,10 @@ class VisualBackbone(nn.Module):
         weights = models.ResNet50_Weights.IMAGENET1K_V1
         resnet = models.resnet50(weights=weights)
         
-        # Keep layers up to Layer 4 (output stride 32)
+        # Keep layers up to Layer 2 for a sharp 64x64 spatial grid
         self.backbone = nn.Sequential(
             resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool,
-            resnet.layer1, resnet.layer2, resnet.layer3, resnet.layer4
+            resnet.layer1, resnet.layer2
         )
         
         # Freeze early layers
@@ -175,6 +175,28 @@ def save_map_features(dataset_root, dataset_path='./processed', bad_map=False, w
                         continue
                 # extract map features
                 extract_map_features(img_path, map_file_name, dataset_path=dataset_path, bad_map=bad_map, white_map=white_map)
+                
+    elif dataset_name.lower() == 'eth':
+        # dataset root should be 'eth' or 'eth/ETH' etc.
+        # Check if ETH folder exists inside
+        eth_dir = os.path.join(dataset_root, 'ETH') if 'ETH' in dirs else dataset_root
+        
+        if not os.path.exists(os.path.join(dataset_path, map_dir_name)):
+            os.makedirs(os.path.join(dataset_path, map_dir_name))
+            
+        scenes = os.listdir(eth_dir)
+        for s in scenes:
+            scene_path = os.path.join(eth_dir, s)
+            if not os.path.isdir(scene_path):
+                continue
+            
+            img_path = os.path.join(scene_path, 'bg.png')
+            if not os.path.exists(img_path):
+                print(f"No bg.png found in {scene_path}")
+                continue
+                
+            map_file_name = os.path.join(map_dir_name, '{}_map.pt'.format(s))
+            extract_map_features(img_path, map_file_name, dataset_path=dataset_path, bad_map=bad_map, white_map=white_map)
     print(f"All map features extracted and saved to {map_dir_name}.")
 
 if __name__ == '__main__':
