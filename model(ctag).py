@@ -1,3 +1,8 @@
+# note this is single stage C-TAG
+# this model is a fusion based C-TAG where model 
+# fails to incooprare maps whenever it more agents
+# only when there are less agents model uses maps
+# we have model.py for 2 stageed C-TAG
 from curses import meta
 import os
 import math
@@ -175,21 +180,19 @@ class VSIE(nn.Module):
         self.th = th
         self.in_feat = in_feat # NEW: Store in_feat dynamically
         self.encoder = nn.LSTM(in_feat, in_feat*2, batch_first=True)
-        # --- STAGE 1: Social Attention (Agent to Agent) ---
-        self.fc_q1 = nn.Linear(in_feat*2, in_feat*4)
-        self.fc_k1 = nn.Linear(in_feat*2, in_feat*4)
-        self.fc_v1 = nn.Linear(in_feat*2, in_feat*4)
-
-        # --- STAGE 2: Environmental Attention (Agent to Map) ---
-        self.fc_q2 = nn.Linear(in_feat*4, in_feat*4)
-        self.fc_k2 = nn.Linear(256, in_feat*4)
-
+        self.fc = nn.Linear(in_feat*2, in_feat*4)
+        self.fc2 = nn.Linear(in_feat*2, in_feat*4)
+        self.fc3 = nn.Linear(in_feat*2, in_feat*4)
         self.fc_out = nn.Linear(in_feat*4, output_dim)
 
         # --- C-TAG CAPACITY FIX ---
         # 1. Widen Compressor: 2048 -> 256 (Was 32)
         #    This preserves 8x more visual detail from the ResNet map.
         self.compressor = nn.Conv2d(in_channels=512, out_channels=256, kernel_size=1)
+        
+        # 2. Widen Fusion Layer: Input is Motion(in_feat*2) + Visual(256)
+        self.visual_fusion = nn.Linear((in_feat*2) + 256, in_feat*2)
+        self.fusion_dropout = nn.Dropout(0.5) 
     def extract_local_context(self, feature_map, agent_coords, img_w=512.0, img_h=512.0):
         batch_size, channels, h_dim, w_dim = feature_map.shape
         _, _, time_steps, num_nodes = agent_coords.shape
@@ -287,30 +290,7 @@ class VSIE(nn.Module):
         X_lstm, _ = self.encoder(x_reshaped.unsqueeze(1)) 
         X = X_lstm.squeeze(1) # [B*T*V, C*2]
 
-        # ==========================================
-        # STAGE 1: SOCIAL SELF-ATTENTION
-        # ==========================================
-        Q1 = self.fc_q1(X)
-        K1 = self.fc_k1(X)
-        v1 = self.fc_v1(X)
-
-        q_dim = Q1.shape[-1]
-        Q1_batched = Q1.view(b, t * n, -1)
-        K1_batched = K1.view(b, t * n, -1)
-        v1_batched = v1.view(b, t * n, -1)
-
-        attn_scores_1 = torch.bmm(Q1_batched, K1_batched.transpose(1, 2)) / math.sqrt(q_dim)
-        attn_probs_1 = Func.sigmoid(attn_scores_1)
-        out1_batched = torch.bmm(attn_probs_1, v1_batched)
-        
-        out1 = out1_batched.view(-1, q_dim)
-        
-        # Apply the C-TAG threshold to isolate important agents
-        out1_thresholded = self.threshold_relu(out1, self.th, x_original[3])
-
-        # ==========================================
-        # STAGE 2: ENVIRONMENTAL CROSS-ATTENTION
-        # ==========================================
+        # --- C-TAG FUSION LOGIC ---
         if metadata is not None:
             batch_size = x_original[0]
             if metadata.size(0) != batch_size:
@@ -319,30 +299,35 @@ class VSIE(nn.Module):
                 visual_map = metadata
                 
             compressed_map = self.compressor(visual_map) 
+            
+            # FIXED: Use abs_coords to sample the map, NOT relative x!
             local_context = self.extract_local_context(compressed_map, abs_coords)
+            
+            # 3. DYNAMIC RESHAPE (Critical Fix)
+            # Use -1 so it automatically adapts to 256 (or any other size)
             local_context_flat = local_context.reshape(X.shape[0], -1)
             
-            # Query is the important agents
-            Q2 = self.fc_q2(out1_thresholded)
-            # Key is the visual map
-            K2 = self.fc_k2(local_context_flat)
-            
-            Q2_batched = Q2.view(b, t * n, -1)
-            K2_batched = K2.view(b, t * n, -1)
-            
-            # Value remains the original trajectory motion
-            v2_batched = v1_batched
-
-            attn_scores_2 = torch.bmm(Q2_batched, K2_batched.transpose(1, 2)) / math.sqrt(q_dim)
-            attn_probs_2 = Func.sigmoid(attn_scores_2)
-            final_out_batched = torch.bmm(attn_probs_2, v2_batched)
-            
-            final_out = final_out_batched.view(-1, q_dim)
-        else:
-            final_out = out1_thresholded
-
-        # Pass the final refined features to the output projection
-        out = self.fc_out(final_out)
+            fused_features = torch.cat([X, local_context_flat], dim=-1)
+            # X = self.visual_fusion(fused_features)
+            X = self.fusion_dropout(self.visual_fusion(fused_features))
+        Q = self.fc(X)     
+        K = self.fc2(X) 
+        v = self.fc3(X) 
+        
+        # Batched Attention
+        q_dim = Q.shape[-1]
+        Q_batched = Q.view(b, t * n, -1) 
+        K_batched = K.view(b, t * n, -1) 
+        v_batched = v.view(b, t * n, -1) 
+        
+        attn_scores = torch.bmm(Q_batched, K_batched.transpose(1, 2)) / math.sqrt(q_dim)
+        attn_probs = Func.sigmoid(attn_scores)
+        out_batched = torch.bmm(attn_probs, v_batched)
+        
+        out = out_batched.view(-1, q_dim)
+        
+        out = self.threshold_relu(out, self.th, x_original[3]) 
+        out = self.fc_out(out)
         
         out = out.view(b, t, n, -1) 
         out = out.permute(0, 3, 1, 2)

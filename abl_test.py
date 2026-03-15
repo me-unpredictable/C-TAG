@@ -63,8 +63,9 @@ def evaluate(model, loader, args, map_type='default'):
     
     # Setup ablation settings logic
     use_no_map = (map_type == 'no_map')
-    # Save the original extract_local_context to restore later
+    # Save the original extract_local_context and compressor to restore later
     original_extract = model.vsie.extract_local_context
+    original_compressor = model.vsie.compressor.forward
 
     if use_no_map:
         # Monkey patch extract_local_context to return zero tensor
@@ -76,7 +77,11 @@ def evaluate(model, loader, args, map_type='default'):
             zeros = torch.zeros((batch_size, time_steps, num_nodes, channels), device=feature_map.device)
             return zeros
         
+        def zero_compressor(v_map):
+            return torch.zeros((v_map.shape[0], 256, 16, 16), device=v_map.device)
+
         model.vsie.extract_local_context = zero_extract
+        model.vsie.compressor.forward = zero_compressor
 
     print(f"\nStarting evaluation (Ablation mode: {map_type})...")
     pbar = tqdm(loader, desc="Evaluating")
@@ -186,6 +191,7 @@ def evaluate(model, loader, args, map_type='default'):
     
     # Restore monkey patch
     model.vsie.extract_local_context = original_extract
+    model.vsie.compressor.forward = original_compressor
     
     return final_ade, final_fde
 
