@@ -1,0 +1,9 @@
+Scene,Model Name,Normal_map ADE,Normal_map FDE,bad_map ADE,bad_map FDE,white_map ADE,white_map FDE,zero_map ADE,zero_map FDE
+deathCircle,CTAG_2.g1.t2.th.0.2_deathCircle_rt,11.7975,21.2648,11.7789,21.2334,11.7851,21.2488,11.7830,21.2460
+hyang,CTAG_2.g1.t2.th.0.2_hyang_rt,6.7819,12.1474,8.6996,15.7213,7.2899,13.1005,8.9309,16.1787
+little,CTAG_2.g1.t2.th.0.2_little_rt,11.4974,20.5648,11.5232,20.6299,11.4589,20.4666,11.5057,20.5922
+coupa,CTAG_2.g1.t2.th.0.4_coupa_rt,4.7978,8.5888,4.7979,8.5909,4.7945,8.5830,4.8380,8.6661
+bookstore,CTAG_2.g1.t2.th.0.6_bookstore_rt,3.5041,6.1380,3.5841,6.2831,3.4828,6.1033,3.7752,6.6365
+gates,CTAG_2.g1.t2.th.0.6_gates_rt,7.7941,14.7633,7.7998,14.7736,7.8156,14.7941,7.9554,15.0323
+nexus,CTAG_2.g1.t2.th.0.6_nexus_rt,4.0199,7.0682,4.0044,7.0309,4.0322,7.0792,4.6415,8.2882
+quad,CTAG_2.g1.t2.th.0.6_quad_rt,4.3955,7.6364,4.3879,7.6255,4.5449,7.9423,4.9114,8.6658
