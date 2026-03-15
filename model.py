@@ -15,159 +15,6 @@ import torch.optim as optim
 import time
 from matplotlib import pyplot as plt
 
-class ConvTemporalGraphical(nn.Module):
-    #Source : https://github.com/yysijie/st-gcn/blob/master/net/st_gcn.py
-    r"""The basic module for applying a graph convolution.
-    Args:
-        in_channels (int): Number of channels in the input sequence data
-        out_channels (int): Number of channels produced by the convolution
-        kernel_size (int): Size of the graph convolving kernel
-        t_kernel_size (int): Size of the temporal convolving kernel
-        t_stride (int, optional): Stride of the temporal convolution. Default: 1
-        t_padding (int, optional): Temporal zero-padding added to both sides of
-            the input. Default: 0
-        t_dilation (int, optional): Spacing between temporal kernel elements.
-            Default: 1
-        bias (bool, optional): If ``True``, adds a learnable bias to the output.
-            Default: ``True``
-    Shape:
-        - Input[0]: Input graph sequence in :math:`(N, in_channels, T_{in}, V)` format
-        - Input[1]: Input graph adjacency matrix in :math:`(K, V, V)` format
-        - Output[0]: Outpu graph sequence in :math:`(N, out_channels, T_{out}, V)` format
-        - Output[1]: Graph adjacency matrix for output data in :math:`(K, V, V)` format
-        where
-            :math:`N` is a batch size,
-            :math:`K` is the spatial kernel size, as :math:`K == kernel_size[1]`,
-            :math:`T_{in}/T_{out}` is a length of input/output sequence,
-            :math:`V` is the number of graph nodes. 
-    """
-    def __init__(self,
-                 in_channels,
-                 out_channels,
-                 kernel_size,
-                 t_kernel_size=1,
-                 t_stride=1,
-                 t_padding=0,
-                 t_dilation=1,
-                 bias=True):
-        super(ConvTemporalGraphical,self).__init__()
-        self.kernel_size = kernel_size
-        self.conv = nn.Conv2d(
-            in_channels,
-            out_channels,
-            kernel_size=(t_kernel_size, 1),
-            padding=(t_padding, 0),
-            stride=(t_stride, 1),
-            dilation=(t_dilation, 1),
-            bias=bias)
-
-    def forward(self, x, A):
-        # Apply temporal convolution
-        x = self.conv(x)
-        
-        # Graph convolution operation using batch matrix multiplication
-        n, c, t, v = x.size()
-        x = x.permute(0, 2, 1, 3)  # [n, t, c, v]
-        x = x.reshape(n * t, c, v)  # [n*t, c, v]
-        
-        # Apply adjacency matrix A - we reshape and use batch matmul
-        if A.dim() == 4:
-            x = torch.matmul(x, A.view(n * t, v, v))
-        else:
-             assert A.size(0) == self.kernel_size
-             x = torch.matmul(x, A.view(self.kernel_size, v, v))  # [n*t, c, v]
-        
-        # Reshape back to original format
-        x = x.view(n, t, c, v)
-        x = x.permute(0, 2, 1, 3)  # [n, c, t, v]
-        
-        return x.contiguous(), A
-
-class st_gcn(nn.Module):
-    r"""Applies a spatial temporal graph convolution over an input graph sequence.
-    Args:
-        in_channels (int): Number of channels in the input sequence data
-        out_channels (int): Number of channels produced by the convolution
-        kernel_size (tuple): Size of the temporal convolving kernel and graph convolving kernel
-        stride (int, optional): Stride of the temporal convolution. Default: 1
-        dropout (int, optional): Dropout rate of the final output. Default: 0
-        residual (bool, optional): If ``True``, applies a residual mechanism. Default: ``True``
-    Shape:
-        - Input[0]: Input graph sequence in :math:`(N, in_channels, T_{in}, V)` format
-        - Input[1]: Input graph adjacency matrix in :math:`(K, V, V)` format
-        - Output[0]: Outpu graph sequence in :math:`(N, out_channels, T_{out}, V)` format
-        - Output[1]: Graph adjacency matrix for output data in :math:`(K, V, V)` format
-        where
-            :math:`N` is a batch size,
-            :math:`K` is the spatial kernel size, as :math:`K == kernel_size[1]`,
-            :math:`T_{in}/T_{out}` is a length of input/output sequence,
-            :math:`V` is the number of graph nodes.
-    """
-
-    def __init__(self,
-                 in_channels,
-                 out_channels,
-                 kernel_size,
-                 use_mdn = False,
-                 stride=1,
-                 dropout=0,
-                 residual=True):
-        super(st_gcn,self).__init__()
-        
-        assert len(kernel_size) == 2
-        if kernel_size[0] % 2 == 1:
-            padding = ((kernel_size[0] - 1) // 2, 0)
-        else:
-            padding = (kernel_size[0] // 2, 0)
-        self.use_mdn = use_mdn
-
-        self.gcn = ConvTemporalGraphical(in_channels, out_channels,
-                                         kernel_size[1])
-        
-
-        self.tcn = nn.Sequential(
-            nn.GroupNorm(1, out_channels), # Replaced BatchNorm2d with GroupNorm(1, C) -> LayerNorm behavior
-            nn.PReLU(),
-            nn.Conv2d(
-                out_channels,
-                out_channels,
-                (kernel_size[0], 1),
-                (stride, 1),
-                padding,
-            ),
-            nn.GroupNorm(1, out_channels), # Replaced BatchNorm2d
-            nn.Dropout(dropout, inplace=True),
-        )
-
-        if not residual:
-            self.residual = lambda x: 0
-
-        elif (in_channels == out_channels) and (stride == 1):
-            self.residual = lambda x: x
-
-        else:
-            self.residual = nn.Sequential(
-                nn.Conv2d(
-                    in_channels,
-                    out_channels,
-                    kernel_size=1,
-                    stride=(stride, 1)),
-                nn.GroupNorm(1, out_channels), # Replaced BatchNorm2d
-            )
-
-        self.prelu = nn.PReLU()
-
-    def forward(self, x, A):
-        res = self.residual(x) # Apply Convolution on the input
-        x, A = self.gcn(x, A)
-
-        x = self.tcn(x) + res
-        
-        if not self.use_mdn:
-            x = self.prelu(x)
-
-        return x, A
-
 class VSIE(nn.Module):
     # Visual Spatio-Temporal Interaction Encoder
     def __init__(self, in_feat, output_dim, th):
@@ -176,9 +23,9 @@ class VSIE(nn.Module):
         self.in_feat = in_feat # NEW: Store in_feat dynamically
         self.encoder = nn.LSTM(in_feat, in_feat*2, batch_first=True)
         # --- STAGE 1: Social Attention (Agent to Agent) ---
-        self.fc_q1 = nn.Linear(in_feat*2, in_feat*4)
-        self.fc_k1 = nn.Linear(in_feat*2, in_feat*4)
-        self.fc_v1 = nn.Linear(in_feat*2, in_feat*4)
+        self.fc_q1 = nn.Linear(in_feat*2, in_feat*4)    # Q uses LSTM output
+        self.fc_k1 = nn.Linear(in_feat, in_feat*4)      # K uses original input x
+        self.fc_v1 = nn.Linear(in_feat, in_feat*4)      # V uses original input x
 
         # --- STAGE 2: Environmental Attention (Agent to Map) ---
         self.fc_q2 = nn.Linear(in_feat*4, in_feat*4)
@@ -291,8 +138,8 @@ class VSIE(nn.Module):
         # STAGE 1: SOCIAL SELF-ATTENTION
         # ==========================================
         Q1 = self.fc_q1(X)
-        K1 = self.fc_k1(X)
-        v1 = self.fc_v1(X)
+        K1 = self.fc_k1(x_reshaped)  # use original x for K
+        v1 = self.fc_v1(x_reshaped)  # use original x for V
 
         q_dim = Q1.shape[-1]
         Q1_batched = Q1.view(b, t * n, -1)
@@ -417,12 +264,7 @@ class CTAG(nn.Module):
         self.vsie = VSIE(input_feat, hidden_size, threshold)
         self.n_gcnn= n_gcnn
         self.n_tcnn = n_tcnn
-                
-        self.st_gcns = nn.ModuleList()
-        self.st_gcns.append(st_gcn(hidden_size, hidden_size, (kernel_size, seq_len)))
-        for j in range(1, self.n_gcnn):
-            self.st_gcns.append(st_gcn(hidden_size, hidden_size, (kernel_size, seq_len)))
-
+        
         # REPLACEMENT: Transformer for Temporal Pattern Extraction
         # We reuse n_tcnn to scale the transformer (e.g. layers)
         # Using d_model=128 to ensure capacity for SDD patterns
@@ -503,9 +345,6 @@ class CTAG(nn.Module):
             map_tensor = Func.dropout2d(map_tensor, p=0.2, training=self.training)
         # Pass to VSIE (Compressor inside VSIE will attach grad)
         v = self.vsie(v, abs_coords, map_tensor) 
-        # v = self.vsie(v, None) # run this to check if map has a bug
-        for k in range(self.n_gcnn):
-            v, a = self.st_gcns[k](v, a)
 
         # Transfomer Temporal Extraction
         # v output from GCN is (N, C, T, V)
