@@ -143,7 +143,8 @@ class TrajectoryDataset(Dataset):
         self, data_dir, obs_len=8, pred_len=12, skip=1, threshold=0.2,
         min_ped=1, delim='\t', norm_lap_matr=True, fill_missing=False, 
         shuffle=False, n_splits=5, dataset_name='', processed_dir='./processed',
-        min_displacement=30.0, reload_data=False, target_set='all'): 
+        min_displacement=30.0, reload_data=False, target_set='all',
+        filter_occlusion_lost=True): 
         
         super(TrajectoryDataset, self).__init__()
 
@@ -165,6 +166,7 @@ class TrajectoryDataset(Dataset):
         self.min_displacement = min_displacement
         self.reload_data = reload_data
         self.target_set = target_set
+        self.filter_occlusion_lost = filter_occlusion_lost
 
         pkl_files = glob.glob(os.path.join(self.data_dir, "**", "*.pkl"), recursive=True)
         
@@ -258,6 +260,11 @@ class TrajectoryDataset(Dataset):
 
         if 'sdd' in self.dataset_name.lower():
             raw_data = read_file(file_path, self.delim)
+            
+            if getattr(self, 'filter_occlusion_lost', False) and raw_data.shape[1] >= 8:
+                valid_mask = (raw_data[:, 6] != 1) & (raw_data[:, 7] != 1)
+                raw_data = raw_data[valid_mask]
+
             if raw_data.shape[1] >= 6: 
                 center_x = (raw_data[:, 1] + raw_data[:, 3]) / 2.0
                 center_y = (raw_data[:, 2] + raw_data[:, 4]) / 2.0
@@ -364,8 +371,8 @@ class TrajectoryDataset(Dataset):
                 # -------------------------------------------
 
                 # --- BOUNDARY FILTER (Edge Noise) ---
-                margin_x = 30.0 * scale_x
-                margin_y = 30.0 * scale_y
+                margin_x = 3.0 * scale_x #was 30
+                margin_y = 3.0 * scale_y #was 30
                 
                 min_x, max_x = np.min(curr_obj_seq[0, :]), np.max(curr_obj_seq[0, :])
                 min_y, max_y = np.min(curr_obj_seq[1, :]), np.max(curr_obj_seq[1, :])
@@ -632,6 +639,7 @@ if __name__ == '__main__':
     parser.add_argument('--obs_len', type=int, default=8, help="Observation length")
     parser.add_argument('--pred_len', type=int, default=12, help="Prediction length")
     parser.add_argument('--reload_data', action='store_true', help="Force re-generation of files")
+    parser.add_argument('--filter_occlusion_lost', action='store_true', help="Filter out lost/occluded agents in SDD")
     
     args = parser.parse_args()
     
@@ -642,6 +650,7 @@ if __name__ == '__main__':
         obs_len=args.obs_len,
         pred_len=args.pred_len,
         target_set=args.set,
-        reload_data=args.reload_data
+        reload_data=args.reload_data,
+        filter_occlusion_lost=args.filter_occlusion_lost
     )
     print("Done!")
