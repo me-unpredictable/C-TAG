@@ -216,26 +216,35 @@ def save_map_features(dataset_root, dataset_path='./processed', bad_map=False, w
                 extract_map_features(img_path, map_file_name, dataset_path=dataset_path, bad_map=bad_map, white_map=white_map, model_name=model_name)
                 
     elif dataset_name.lower() == 'eth':
-        # dataset root should be 'eth' or 'eth/ETH' etc.
-        # Check if ETH folder exists inside
-        eth_dir = os.path.join(dataset_root, 'ETH') if 'ETH' in dirs else dataset_root
-        
         if not os.path.exists(os.path.join(dataset_path, map_dir_name)):
             os.makedirs(os.path.join(dataset_path, map_dir_name))
             
-        scenes = os.listdir(eth_dir)
-        for s in scenes:
-            scene_path = os.path.join(eth_dir, s)
-            if not os.path.isdir(scene_path):
-                continue
+        # Check for ETH and UCY subdirectories
+        sub_dirs = [d for d in ['ETH', 'UCY', 'eth', 'ucy'] if d in dirs]
+        if not sub_dirs:
+            sub_dirs = [''] # Fallback to root if specific subdirs not found
             
-            img_path = os.path.join(scene_path, 'bg.png')
-            if not os.path.exists(img_path):
-                print(f"No bg.png found in {scene_path}")
-                continue
+        for sub_dir in sub_dirs:
+            base_dir = os.path.join(dataset_root, sub_dir)
+            scenes = os.listdir(base_dir)
+            for s in scenes:
+                scene_path = os.path.join(base_dir, s)
+                if not os.path.isdir(scene_path):
+                    continue
                 
-            map_file_name = os.path.join(map_dir_name, '{}_map.pt'.format(s))
-            extract_map_features(img_path, map_file_name, dataset_path=dataset_path, bad_map=bad_map, white_map=white_map, model_name=model_name)
+                img_path_png = os.path.join(scene_path, 'bg.png')
+                img_path_jpg = os.path.join(scene_path, 'bg.jpg')
+                
+                if os.path.exists(img_path_png):
+                    img_path = img_path_png
+                elif os.path.exists(img_path_jpg):
+                    img_path = img_path_jpg
+                else:
+                    print(f"No bg.png or bg.jpg found in {scene_path}")
+                    continue
+                    
+                map_file_name = os.path.join(map_dir_name, '{}_map.pt'.format(s))
+                extract_map_features(img_path, map_file_name, dataset_path=dataset_path, bad_map=bad_map, white_map=white_map, model_name=model_name)
     print(f"All map features extracted and saved to {map_dir_name}.")
 
 if __name__ == '__main__':

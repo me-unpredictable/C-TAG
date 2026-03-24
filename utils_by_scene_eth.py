@@ -145,35 +145,49 @@ class TrajectoryDataset(Dataset):
             self._init_lazy_loading()
 
     def _process_raw_data(self):
-        scenes = ['seq_eth', 'seq_hotel']
-        print(f"Processing {len(scenes)} scenes in ETH.")
+        datasets = ['ETH', 'UCY']
+        print(f"Processing scenes in ETH and UCY.")
 
-        for scene_name in scenes:
-            current_scene_path = os.path.join(self.data_dir, 'ETH', scene_name)
-            path = os.path.join(current_scene_path, 'obsmat.txt')
-            if not os.path.exists(path): 
-                print(f"Warning: {path} not found.")
+        for dataset_name in datasets:
+            dataset_path = os.path.join(self.data_dir, dataset_name)
+            if not os.path.exists(dataset_path):
                 continue
-
-            img_path = os.path.join(current_scene_path, 'bg.png')
             
-            splits = ['train', 'val', 'test']
-            for s_name in splits:
-                if self.target_set != 'all' and s_name != self.target_set:
+            scenes = [d for d in os.listdir(dataset_path) if os.path.isdir(os.path.join(dataset_path, d))]
+            
+            for scene_name in scenes:
+                current_scene_path = os.path.join(dataset_path, scene_name)
+                txt_files = glob.glob(os.path.join(current_scene_path, '*.txt'))
+                
+                if not txt_files:
+                    print(f"Warning: No .txt files found in {current_scene_path}.")
                     continue
                 
-                split_out_dir = os.path.join(self.processed_dir, s_name, scene_name)
-                os.makedirs(split_out_dir, exist_ok=True)
+                img_path = os.path.join(current_scene_path, 'bg.jpg')
+                if not os.path.exists(img_path):
+                    img_path = os.path.join(current_scene_path, 'bg.png')
                 
-                meta_id = f"{scene_name}_map.pt" 
-                save_name = f"{scene_name}_{s_name}.pkl"
-                save_path = os.path.join(split_out_dir, save_name)
+                splits = ['train', 'val', 'test']
+                for s_name in splits:
+                    if self.target_set != 'all' and s_name != self.target_set:
+                        continue
+                    
+                    split_out_dir = os.path.join(self.processed_dir, s_name, scene_name)
+                    os.makedirs(split_out_dir, exist_ok=True)
+                    
+                    meta_id = f"{scene_name}_map.pt" 
 
-                if os.path.exists(save_path) and not self.reload_data:
-                    continue
+                    print(f"Processing: {s_name} | {dataset_name} | {scene_name}")
+                    # Process all txt files in the scene dir
+                    for txt_file in txt_files:
+                        base_txt = os.path.splitext(os.path.basename(txt_file))[0]
+                        save_name = f"{scene_name}_{base_txt}_{s_name}.pkl"
+                        save_path = os.path.join(split_out_dir, save_name)
 
-                print(f"Processing: {s_name} | ETH | {scene_name}")
-                self._process_single_video(path, meta_id, save_path, img_path, s_name)
+                        if os.path.exists(save_path) and not self.reload_data:
+                            continue
+
+                        self._process_single_video(txt_file, meta_id, save_path, img_path, s_name)
 
     def _process_single_video(self, file_path, meta_id, save_path, img_path, split_name):
         if os.path.exists(img_path):
@@ -184,24 +198,36 @@ class TrajectoryDataset(Dataset):
             orig_w, orig_h = 512, 512
 
         raw_data = read_file(file_path, self.delim)
-        # ETH format: frame_id, agent_id, pos_x, pos_z, pos_y, ...
-        # Keep only frame_id, agent_id, pos_x, pos_y
-        data = raw_data[:, [0, 1, 2, 4]]
+        # Format: frame_id, agent_id, pos_x, pos_y
+        data = raw_data[:, [0, 1, 2, 3]]
         data = data[data[:, 0].argsort()]
         frames = np.unique(data[:, 0]).tolist()
         
         num_frames = len(frames)
         n_train = int(num_frames * 0.7)
-        n_val = int(num_frames * 0.15)
+        n_test = int(num_frames * 0.2)
         
-        if split_name == 'train':
-            frames_to_keep = frames[:n_train]
-        elif split_name == 'val':
-            frames_to_keep = frames[n_train:n_train+n_val]
-        else: # test
-            frames_to_keep = frames[n_train+n_val:]
-            
-        data = data[np.isin(data[:, 0], frames_to_keep)]
+        train_frames = set(frames[:n_train])
+        test_frames = set(frames[n_train:n_train+n_test])
+        val_frames = set(frames[n_train+n_test:])
+        
+        valid_track_ids = []
+        track_ids = np.unique(data[:, 1])
+        for tid in track_ids:
+            t_frames = data[data[:, 1] == tid, 0]
+            if split_name == 'train' and all(f in train_frames for f in t_frames):
+                valid_track_ids.append(tid)
+            elif split_name == 'test' and all(f in test_frames for f in t_frames):
+                valid_track_ids.append(tid)
+            elif split_name == 'val' and all(f in val_frames for f in t_frames):
+                valid_track_ids.append(tid)
+                
+        data = data[np.isin(data[:, 1], valid_track_ids)]
+        
+        if len(data) == 0:
+            print(f"Skipping {split_name} for {file_path}: No full trajectories found.")
+            return
+
         # Re-verify frames after filtering
         frames = np.unique(data[:, 0]).tolist()
         
