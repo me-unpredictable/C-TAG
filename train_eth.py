@@ -101,6 +101,25 @@ parser.add_argument('--n_splits', type=int, default=1, help='(Deprecated) Number
 args = parser.parse_args()
 
 
+def get_expected_split_pkl_files(split_dir, split_name):
+    pkl_files = sorted(glob.glob(os.path.join(split_dir, "*.pkl")))
+    if not pkl_files:
+        return []
+
+    expected_suffix = f"_{split_name}.pkl"
+    invalid_files = [
+        path for path in pkl_files
+        if not os.path.basename(path).endswith(expected_suffix)
+    ]
+
+    if invalid_files:
+        raise RuntimeError(
+            f"Unexpected files found in {split_dir} for split '{split_name}': {invalid_files}"
+        )
+
+    return pkl_files
+
+
 # -----------------------------------------------------------------------------
 # TRAINING FUNCTIONS
 # -----------------------------------------------------------------------------
@@ -407,7 +426,7 @@ if __name__ == '__main__':
 
     # Create log directories
     os.makedirs(args.log_dir, exist_ok=True)
-    checkpoint_dir = './checkpoint/'+args.tag+'/'
+    checkpoint_dir = './checkpoint/'+'ETH_'+args.tag+'/'
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     # Log file setup
@@ -453,9 +472,9 @@ if __name__ == '__main__':
             processed_val_dir = os.path.join('./processed/val', scene)
             processed_test_dir = os.path.join('./processed/test', scene)
             
-            t_ex = os.path.exists(processed_train_dir) and len(glob.glob(os.path.join(processed_train_dir, "*.pkl"))) > 0
-            v_ex = os.path.exists(processed_val_dir) and len(glob.glob(os.path.join(processed_val_dir, "*.pkl"))) > 0
-            ts_ex = os.path.exists(processed_test_dir) and len(glob.glob(os.path.join(processed_test_dir, "*.pkl"))) > 0
+            t_ex = os.path.exists(processed_train_dir) and len(get_expected_split_pkl_files(processed_train_dir, 'train')) > 0
+            v_ex = os.path.exists(processed_val_dir) and len(get_expected_split_pkl_files(processed_val_dir, 'val')) > 0
+            ts_ex = os.path.exists(processed_test_dir) and len(get_expected_split_pkl_files(processed_test_dir, 'test')) > 0
             
             if not (t_ex and v_ex and ts_ex):
                 needs_generation = True
@@ -479,8 +498,10 @@ if __name__ == '__main__':
     for scene in scenes:
         processed_train_dir = os.path.join('./processed/train', scene)
         processed_val_dir = os.path.join('./processed/val', scene)
+        train_pkl_files = get_expected_split_pkl_files(processed_train_dir, 'train')
 
         print(f"Initializing Datasets for Scene: {scene}...")
+        print(f"Using train split files: {[os.path.basename(path) for path in train_pkl_files]}")
 
         dset_train = DatasetClass(
             data_dir=processed_train_dir,
@@ -494,6 +515,8 @@ if __name__ == '__main__':
         train_datasets.append(dset_train)
 
         if not args.skip_val:
+            val_pkl_files = get_expected_split_pkl_files(processed_val_dir, 'val')
+            print(f"Using val split files: {[os.path.basename(path) for path in val_pkl_files]}")
             dset_val = DatasetClass(
                 data_dir=processed_val_dir,
                 obs_len=args.obs_seq_len,

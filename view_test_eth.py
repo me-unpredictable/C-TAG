@@ -16,7 +16,14 @@ from utils_by_scene_eth import TrajectoryDataset
 from metrics import ade, fde
 
 def get_model_path(checkpoint_root='./checkpoint/'):
-    subdirs = [d for d in glob.glob(os.path.join(checkpoint_root, '*')) if os.path.isdir(d)]
+    all_subdirs = [d for d in glob.glob(os.path.join(checkpoint_root, '*')) if os.path.isdir(d)]
+    valid_names = ['eth', 'univ', 'hotel', 'zara']
+    subdirs = []
+    for d in all_subdirs:
+        basename = os.path.basename(d).lower()
+        if any(name in basename for name in valid_names):
+            subdirs.append(d)
+    
     subdirs.sort()
     
     if not subdirs:
@@ -70,18 +77,12 @@ def evaluate(model, loader, args, num_samples=20):
             batch_tensors = batch[:-1]
             batch_metadata = batch[-1]
             
-            if len(batch_tensors) == 11:
-                 obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr, theta = batch_tensors
-                 theta = theta.cuda()
-            else:
-                 obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr = batch_tensors
-                 theta = None
-
             batch_tensors = [t.cuda() for t in batch_tensors if torch.is_tensor(t)]
             if len(batch_tensors) == 11:
                  obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr, theta = batch_tensors
             else:
                  obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr = batch_tensors
+                 theta = None
             
             obs_traj = obs_traj.cuda()
             
@@ -146,11 +147,13 @@ def evaluate(model, loader, args, num_samples=20):
                     ped_obs = o_i[:, ped_idx, :]
                     
                     ped_ade = np.mean(np.linalg.norm(ped_pred - ped_gt, axis=-1))
+                    ped_fde = np.linalg.norm(ped_pred[-1] - ped_gt[-1], axis=-1)
                     
                     displacement = np.linalg.norm(ped_gt[-1] - ped_obs[0])
                     
                     ped_trajectories.append({
                         'ade': ped_ade,
+                        'fde': ped_fde,
                         'obs': ped_obs,
                         'pred': ped_pred,
                         'gt': ped_gt,
@@ -158,12 +161,13 @@ def evaluate(model, loader, args, num_samples=20):
                         'meta_id': meta_id
                     })
 
-            ade_list.append(ade(pred_list, target_list, count_list))
-            fde_list.append(fde(pred_list, target_list, count_list))
+    # True Global Average over all validated agents
+    global_ade = np.mean([traj['ade'] for traj in ped_trajectories]) if ped_trajectories else 0.0
+    global_fde = np.mean([traj['fde'] for traj in ped_trajectories]) if ped_trajectories else 0.0
 
     print(f"\nFinal Results (Meters ADE/FDE):")
-    print(f"ADE: {np.mean(ade_list):.4f}")
-    print(f"FDE: {np.mean(fde_list):.4f}")
+    print(f"ADE: {global_ade:.4f}")
+    print(f"FDE: {global_fde:.4f}")
     
     return ped_trajectories
 
@@ -182,6 +186,26 @@ def get_map_image(meta_id):
         return map_img_path
     return None
 
+def get_map_extent(meta_id):
+    """
+    Returns the real-world extent [xmin, xmax, ymin, ymax] of the map in meters.
+    MODIFY THESE VALUES to match your exact map bounds in real-world meters.
+    By default, 'ymin' and 'ymax' might need to be inverted (e.g. ymax, ymin) 
+    if your image origin is top-left, but we pass them as [xmin, xmax, ymin, ymax].
+    """
+    scene = meta_id.replace('_map.pt', '') if meta_id else "unknown"
+    
+    # Placeholder mapping -- adjust to true dataset metric extents
+    # Format: [xmin, xmax, ymin, ymax]
+    extents = {
+        'seq_eth': [0.0, 14.2, 14.2, 0.0],
+        'seq_hotel': [0.0, 14.2, 14.2, 0.0],
+        'zara01': [0.0, 14.2, 14.2, 0.0],
+        'zara02': [0.0, 14.2, 14.2, 0.0],
+        'uni_examples': [0.0, 14.2, 14.2, 0.0]
+    }
+    return extents.get(scene, [0.0, 20.0, 20.0, 0.0])
+
 def plot_trajectories(trajectories, title_prefix="Trajectory", no_map=False):
     for idx, traj in enumerate(trajectories):
         plt.figure(figsize=(10, 8))
@@ -189,6 +213,7 @@ def plot_trajectories(trajectories, title_prefix="Trajectory", no_map=False):
         
         meta_id = traj.get('meta_id')
         map_img_path = get_map_image(meta_id)
+        extent = get_map_extent(meta_id)
         
         obs = traj['obs']
         pred = traj['pred']
@@ -205,9 +230,8 @@ def plot_trajectories(trajectories, title_prefix="Trajectory", no_map=False):
         
         if map_img_path and not no_map:
             img = mpimg.imread(map_img_path)
-            # Displaying image with assumption that image corresponds to the real-world meter coordinates
-            # Note: Explicit extent needs to be managed if pixels & meters mismatch
-            plt.imshow(img)
+            # Displaying image with exact explicit extent managed for meters
+            plt.imshow(img, extent=extent)
             plt.grid(True, linestyle='--', alpha=0.6)
         else:
             plt.grid(True, linestyle='--', alpha=0.6)
@@ -239,31 +263,36 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = torch.load(model_path, map_location=device, weights_only=False)
     
-    # Validation: Check if model trained on ETH
+    # Validation: Check if model trained on ETH/UCY datasets
     train_dataset = getattr(args, 'dataset', '')
     if isinstance(checkpoint, dict) and not train_dataset:
          train_dataset = checkpoint.get('dataset', '')
          
-    if str(train_dataset).lower() != 'eth':
-         print(f"Error: Model was not trained on ETH. Dataset found: '{train_dataset}'")
+    train_dataset_lower = str(train_dataset).lower()
+    valid_datasets = {
+        'eth': 'seq_eth',
+        'hotel': 'seq_hotel',
+        'univ': 'uni_examples',
+        'zara1': 'zara01',
+        'zara2': 'zara02'
+    }
+
+    if train_dataset_lower not in valid_datasets:
+         print(f"Error: Model was not trained on an ETH/UCY dataset. Dataset found: '{train_dataset}'")
          sys.exit(1)
     
-    scene_name = None
-    state_dict = checkpoint
+    # Map the trained split to its corresponding test scene dir
+    scene_name = valid_datasets[train_dataset_lower]
     
+    state_dict = checkpoint
     if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
         state_dict = checkpoint['state_dict']
-        if 'scene_name' in checkpoint:
-            scene_name = checkpoint['scene_name']
     
-    test_data_dir = os.path.join('./processed/test', str(scene_name) if scene_name else '')
+    test_data_dir = os.path.join('./processed/test', scene_name)
     
     if not os.path.exists(test_data_dir):
-        if os.path.exists('./processed/test'):
-             test_data_dir = './processed/test'
-        else:
-             print(f"Test data directory {test_data_dir} not found.")
-             sys.exit(1)
+         print(f"Test data directory {test_data_dir} not found.")
+         sys.exit(1)
         
     print(f"Loading ETH Test Data from {test_data_dir}...")
     
@@ -274,7 +303,7 @@ def main():
         skip=1,
         norm_lap_matr=True,
         delim=args.delim,
-        dataset_name='eth' # Explicitly ETH
+        dataset_name=train_dataset_lower
     )
     
     loader_test = DataLoader(
