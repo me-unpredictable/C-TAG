@@ -21,6 +21,44 @@ from utils_by_scene import TrajectoryDataset
 from utils_by_scene_eth import TrajectoryDataset as TrajectoryDatasetETH
 from metrics import *#ade_loss, fde_loss, bivariate_loss
 
+def extract_model_metadata(batch_metadata_list):
+    model_metadata = []
+    for meta_item in batch_metadata_list:
+        if isinstance(meta_item, (list, tuple)) and len(meta_item) > 0:
+            model_metadata.append(meta_item[0])
+        else:
+            model_metadata.append(meta_item)
+    return model_metadata
+
+def convert_meters_to_pixels(abs_coords, batch_metadata_list):
+    """Projects meter coordinates to pixel coordinates using Homography."""
+    abs_coords_px = abs_coords.clone()
+    batch_size = abs_coords.shape[0]
+    
+    for b_idx in range(batch_size):
+        meta_tuple = batch_metadata_list[b_idx]
+        if isinstance(meta_tuple, tuple) and len(meta_tuple) >= 4:
+            H = meta_tuple[3] 
+            H_tensor = torch.tensor(H, dtype=torch.float32, device=abs_coords.device)
+            
+            x = abs_coords[b_idx, 0, :, :]
+            y = abs_coords[b_idx, 1, :, :]
+            
+            x_prime = H_tensor[0,0]*x + H_tensor[0,1]*y + H_tensor[0,2]
+            y_prime = H_tensor[1,0]*x + H_tensor[1,1]*y + H_tensor[1,2]
+            z_prime = H_tensor[2,0]*x + H_tensor[2,1]*y + H_tensor[2,2]
+            
+            # Avoid division by zero
+            z_prime = torch.clamp(z_prime, min=1e-6)
+            
+            u = x_prime / z_prime
+            v = y_prime / z_prime
+            
+            abs_coords_px[b_idx, 0, :, :] = u
+            abs_coords_px[b_idx, 1, :, :] = v
+            
+    return abs_coords_px
+
 # [FIX] Define masked_mse_loss locally if import fails or for clarity
 def masked_mse_loss(V_pred, V_trgt, mask=None):
     """
@@ -84,8 +122,8 @@ parser.add_argument('--scene_name', default='eth', help='Scene name to train on 
 # Training specific parameters
 parser.add_argument('--batch_size', type=int, default=64, help='minibatch size (Virtual Batch Size for Gradient Accumulation)')
 parser.add_argument('--num_epochs', type=int, default=150, help='number of epochs')
-parser.add_argument('--clip_grad', type=float, default=5.0, help='gradient clipping')
-parser.add_argument('--lr', type=float, default=0.1, help='learning rate')
+parser.add_argument('--clip_grad', type=float, default=3, help='gradient clipping')
+parser.add_argument('--lr', type=float, default=0.01, help='learning rate')
 parser.add_argument('--lr_sh_rate', type=int, default=75, help='number of steps to drop the lr')
 parser.add_argument('--use_lrschd', action="store_true", default=True, help='Use lr rate scheduler')
 parser.add_argument('--tag', default='tag', help='personal tag for the model')
@@ -165,18 +203,10 @@ def train(epoch, model, optimizer, loader_train, metrics):
         # Prepare Absolute Coordinates for VSIE Map Sampling
         # obs_traj is [Batch, Nodes, 2, Time] -> Convert to [Batch, 2, Time, Nodes]
         abs_coords = obs_traj.permute(0, 2, 3, 1).contiguous()
-        # Extract map filenames from metadata tuples
-        
-        # [FIX] Safer metadata extraction
-        model_metadata = []
-        for m in batch_metadata_list:
-            if isinstance(m, (list, tuple)):
-                 model_metadata.append(m[0])
-            else:
-                 model_metadata = batch_metadata_list # Assume clean list if not tuple
-                 break
-        
-        V_pred, _ = model(V_obs_tmp, A_obs, abs_coords, model_metadata) 
+        abs_coords_px = convert_meters_to_pixels(abs_coords, batch_metadata_list)
+        model_metadata = extract_model_metadata(batch_metadata_list)
+
+        V_pred, _ = model(V_obs_tmp, A_obs, abs_coords_px, model_metadata)
         V_pred = V_pred.permute(0, 2, 3, 1) # [Batch, Time, Nodes, 5]
         
         # --- CANONICAL UN-ROTATION ---
@@ -231,10 +261,11 @@ def train(epoch, model, optimizer, loader_train, metrics):
     metrics['train_loss'].append(loss_batch / len(loader_train))
 
 
-def calculate_ade_fde(model, loader_val, metrics):
+def calculate_ade_fde(model, loader_val, metrics, record_metrics=True):
     model.eval()
-    ade_batch_list = []
-    fde_batch_list = []
+    ade_total = 0.0
+    fde_total = 0.0
+    total_sequences = 0
     
     with torch.no_grad():
         for batch in loader_val: 
@@ -258,13 +289,14 @@ def calculate_ade_fde(model, loader_val, metrics):
              theta = theta.to(next(model.parameters()).device)
 
              V_obs_tmp = V_obs.permute(0, 3, 1, 2)
-             model_metadata = [m[0] for m in batch_metadata_list] 
+             model_metadata = extract_model_metadata(batch_metadata_list)
              
              # NEW: Prepare Absolute Coordinates
              abs_coords = obs_traj.permute(0, 2, 3, 1).contiguous()
+             abs_coords_px = convert_meters_to_pixels(abs_coords, batch_metadata_list)
              
              # NEW: Pass abs_coords to the model
-             V_pred, _ = model(V_obs_tmp, A_obs, abs_coords, model_metadata)
+             V_pred, _ = model(V_obs_tmp, A_obs, abs_coords_px, model_metadata)
              
              V_pred = V_pred.permute(0, 2, 3, 1) # [Batch, Time, Nodes, 5]
 
@@ -330,14 +362,22 @@ def calculate_ade_fde(model, loader_val, metrics):
                  target_list.append(t_i)
                  count_list.append(num_valid)
 
-             ade_batch_list.append(ade(pred_list, target_list, count_list))
-             fde_batch_list.append(fde(pred_list, target_list, count_list))
+             if pred_list:
+                 batch_sequence_count = len(pred_list)
+                 ade_total += ade(pred_list, target_list, count_list) * batch_sequence_count
+                 fde_total += fde(pred_list, target_list, count_list) * batch_sequence_count
+                 total_sequences += batch_sequence_count
 
-    final_ade = np.mean(ade_batch_list)
-    final_fde = np.mean(fde_batch_list)
+    if total_sequences == 0:
+        final_ade = 0.0
+        final_fde = 0.0
+    else:
+        final_ade = ade_total / total_sequences
+        final_fde = fde_total / total_sequences
     
-    metrics['ade'].append(final_ade)
-    metrics['fde'].append(final_fde)
+    if record_metrics:
+        metrics['ade'].append(final_ade)
+        metrics['fde'].append(final_fde)
     
     return final_ade, final_fde
 
@@ -366,10 +406,10 @@ def vald(epoch, model, loader_val, metrics, constant_metrics):
             V_obs_tmp = V_obs.permute(0, 3, 1, 2)
             # Prepare Absolute Coordinates for VSIE
             abs_coords = obs_traj.permute(0, 2, 3, 1).contiguous()
-            # Extract map filenames
-            model_metadata = [m[0] for m in batch_metadata_list]
-            # Pass abs_coords to the model
-            V_pred, _ = model(V_obs_tmp, A_obs, abs_coords, model_metadata)
+            abs_coords_px = convert_meters_to_pixels(abs_coords, batch_metadata_list)
+            
+            model_metadata = extract_model_metadata(batch_metadata_list)
+            V_pred, _ = model(V_obs_tmp, A_obs, abs_coords_px, model_metadata)
             V_pred = V_pred.permute(0, 2, 3, 1)
             # --- CANONICAL UN-ROTATION ---
             V_pred_rel = V_pred[..., :2]
@@ -446,17 +486,18 @@ if __name__ == '__main__':
     # Scene selection logic for ETH/UCY datasets
     scene_arg = args.scene_name.lower()
     if scene_arg == 'eth':
-        scenes = ['seq_eth']
+        scenes = ['eth']
     elif scene_arg == 'hotel':
-        scenes = ['seq_hotel']
+        scenes = ['hotel']
     elif scene_arg == 'univ':
-        scenes = ['uni_examples', 'students01', 'students03']
+        scenes = ['univ']
     elif scene_arg in ['zara1', 'zara01']:
         scenes = ['zara01']
     elif scene_arg in ['zara2', 'zara02']:
-        scenes = ['zara02', 'zara03']
+        scenes = ['zara02']
     else:
-        scenes = [args.scene_name]
+        print(f"Invalid scene name '{args.scene_name}' provided. Defaulting to all scenes.")
+        scenes = ['eth', 'hotel', 'univ', 'zara01', 'zara02']
     
     train_datasets = []
     val_datasets = []
@@ -534,7 +575,7 @@ if __name__ == '__main__':
     loader_train = DataLoader(
         combined_train_dset,
         batch_size=args.batch_size, # Use actual batch size for training
-        shuffle=args.shuffle,
+        shuffle=False, # can't shuffle scene based data
         num_workers=4,
         collate_fn=DatasetClass.collate_fn 
     )
@@ -718,7 +759,7 @@ if __name__ == '__main__':
             else:
                 model.load_state_dict(checkpoint)
         
-        ade_calc, fde_calc = calculate_ade_fde(model, loader_val, metrics)
+        ade_calc, fde_calc = calculate_ade_fde(model, loader_val, metrics, record_metrics=False)
         print(f"Final Best Model - ADE: {ade_calc:.4f}, FDE: {fde_calc:.4f}")
         log_file.write(f"FINAL,,,{ade_calc},{fde_calc}\n")
 

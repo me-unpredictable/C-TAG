@@ -15,7 +15,41 @@ from model import CTAG
 from utils_by_scene_eth import TrajectoryDataset 
 from metrics import ade, fde
 
-def get_model_path(checkpoint_root='./checkpoint/'):
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def convert_meters_to_pixels(abs_coords, batch_metadata_list):
+    """Projects meter coordinates to pixel coordinates using Homography."""
+    abs_coords_px = abs_coords.clone()
+    batch_size = abs_coords.shape[0]
+    
+    for b_idx in range(batch_size):
+        meta_tuple = batch_metadata_list[b_idx]
+        if isinstance(meta_tuple, tuple) and len(meta_tuple) >= 4:
+            H = meta_tuple[3] 
+            H_tensor = torch.tensor(H, dtype=torch.float32, device=abs_coords.device)
+            
+            x = abs_coords[b_idx, 0, :, :]
+            y = abs_coords[b_idx, 1, :, :]
+            
+            x_prime = H_tensor[0,0]*x + H_tensor[0,1]*y + H_tensor[0,2]
+            y_prime = H_tensor[1,0]*x + H_tensor[1,1]*y + H_tensor[1,2]
+            z_prime = H_tensor[2,0]*x + H_tensor[2,1]*y + H_tensor[2,2]
+            
+            # Avoid division by zero
+            z_prime = torch.clamp(z_prime, min=1e-6)
+            
+            u = x_prime / z_prime
+            v = y_prime / z_prime
+            
+            abs_coords_px[b_idx, 0, :, :] = u
+            abs_coords_px[b_idx, 1, :, :] = v
+            
+    return abs_coords_px
+
+def get_model_path(checkpoint_root=None):
+    if checkpoint_root is None:
+        checkpoint_root = os.path.join(BASE_DIR, 'checkpoint')
+
     all_subdirs = [d for d in glob.glob(os.path.join(checkpoint_root, '*')) if os.path.isdir(d)]
     valid_names = ['eth', 'univ', 'hotel', 'zara']
     subdirs = []
@@ -62,11 +96,62 @@ def get_model_path(checkpoint_root='./checkpoint/'):
         
     return model_path, args_path
 
+def resolve_eval_scene_name(model_path, args, checkpoint):
+    if isinstance(checkpoint, dict):
+        scene_name = checkpoint.get('scene_name')
+        if scene_name:
+            return str(scene_name).lower()
+
+    scene_name = getattr(args, 'scene_name', '')
+    if scene_name:
+        return str(scene_name).lower()
+
+    exp_name = os.path.basename(os.path.dirname(model_path)).lower()
+    return exp_name.rsplit('_', 1)[-1]
+
+def resolve_test_scene_dirs(scene_name, processed_root=None):
+    if processed_root is None:
+        processed_root = os.path.join(BASE_DIR, 'processed', 'test')
+
+    if not os.path.isdir(processed_root):
+        return []
+
+    scene_name = str(scene_name).lower().strip()
+    child_dirs = [
+        os.path.join(processed_root, name)
+        for name in sorted(os.listdir(processed_root))
+        if os.path.isdir(os.path.join(processed_root, name))
+    ]
+
+    normalized_candidates = {
+        scene_name,
+        scene_name.replace('seq_', ''),
+        f"seq_{scene_name}",
+    }
+
+    if scene_name.startswith('zara') and scene_name[4:].isdigit():
+        normalized_candidates.add(f"zara{int(scene_name[4:]):02d}")
+
+    matches = [
+        scene_dir for scene_dir in child_dirs
+        if os.path.basename(scene_dir).lower() in normalized_candidates
+    ]
+
+    if matches:
+        return matches
+
+    return [
+        scene_dir for scene_dir in child_dirs
+        if scene_name in os.path.basename(scene_dir).lower()
+        or os.path.basename(scene_dir).lower() in scene_name
+    ]
+
 def evaluate(model, loader, args, num_samples=20):
     model.eval()
     
-    ade_list = []
-    fde_list = []
+    ade_total = 0.0
+    fde_total = 0.0
+    total_sequences = 0
     ped_trajectories = []
     
     print(f"Starting evaluation...")
@@ -77,19 +162,27 @@ def evaluate(model, loader, args, num_samples=20):
             batch_tensors = batch[:-1]
             batch_metadata = batch[-1]
             
+            if len(batch_tensors) == 11:
+                 obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr, theta = batch_tensors
+                 theta = theta.cuda()
+            else:
+                 obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr = batch_tensors
+                 theta = None
+
             batch_tensors = [t.cuda() for t in batch_tensors if torch.is_tensor(t)]
             if len(batch_tensors) == 11:
                  obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr, theta = batch_tensors
             else:
                  obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, loss_mask, V_obs, A_obs, V_tr, A_tr = batch_tensors
-                 theta = None
             
             obs_traj = obs_traj.cuda()
             
             V_obs_tmp = V_obs.permute(0, 3, 1, 2) 
             abs_coords = obs_traj.permute(0, 2, 3, 1).contiguous()
+            abs_coords_px = convert_meters_to_pixels(abs_coords, batch_metadata)
+            
             model_metadata = [m[0] for m in batch_metadata]
-            V_pred, _ = model(V_obs_tmp, A_obs, abs_coords, model_metadata)
+            V_pred, _ = model(V_obs_tmp, A_obs, abs_coords_px, model_metadata)
             
             V_pred = V_pred.permute(0, 2, 3, 1) 
             V_pred_rel = V_pred[..., :2]
@@ -131,7 +224,8 @@ def evaluate(model, loader, args, num_samples=20):
                 
                 valid_rows = np.any(loss_mask_np[i] > 0, axis=1)
                 num_valid = np.sum(valid_rows)
-                if num_valid == 0: num_valid = 1 
+                if num_valid == 0:
+                    continue
                 
                 p_i = V_pred_np[i, :, :num_valid, :2].copy()
                 t_i = V_tr_np[i, :, :num_valid, :2].copy()
@@ -147,43 +241,54 @@ def evaluate(model, loader, args, num_samples=20):
                     ped_obs = o_i[:, ped_idx, :]
                     
                     ped_ade = np.mean(np.linalg.norm(ped_pred - ped_gt, axis=-1))
-                    ped_fde = np.linalg.norm(ped_pred[-1] - ped_gt[-1], axis=-1)
                     
                     displacement = np.linalg.norm(ped_gt[-1] - ped_obs[0])
                     
+                    
+                    H_mat = meta_tuple[3] if isinstance(meta_tuple, tuple) and len(meta_tuple) >= 4 else None
+                    
                     ped_trajectories.append({
                         'ade': ped_ade,
-                        'fde': ped_fde,
                         'obs': ped_obs,
                         'pred': ped_pred,
                         'gt': ped_gt,
                         'displacement': displacement,
-                        'meta_id': meta_id
+                        'meta_id': meta_id,
+                        'H': H_mat
                     })
 
-    # True Global Average over all validated agents
-    global_ade = np.mean([traj['ade'] for traj in ped_trajectories]) if ped_trajectories else 0.0
-    global_fde = np.mean([traj['fde'] for traj in ped_trajectories]) if ped_trajectories else 0.0
+            if pred_list:
+                batch_sequence_count = len(pred_list)
+                ade_total += ade(pred_list, target_list, count_list) * batch_sequence_count
+                fde_total += fde(pred_list, target_list, count_list) * batch_sequence_count
+                total_sequences += batch_sequence_count
+
+    final_ade = 0.0 if total_sequences == 0 else ade_total / total_sequences
+    final_fde = 0.0 if total_sequences == 0 else fde_total / total_sequences
 
     print(f"\nFinal Results (Meters ADE/FDE):")
-    print(f"ADE: {global_ade:.4f}")
-    print(f"FDE: {global_fde:.4f}")
+    print(f"ADE: {final_ade:.4f}")
+    print(f"FDE: {final_fde:.4f}")
     
     return ped_trajectories
 
 def get_map_image(meta_id):
     if not meta_id:
         return None
-    # Assuming meta_id format is "seq_eth_map.pt" and we want "seq_eth_map.png"
-    # User specified map titles are like "seq_eth_map.png" in "maps" directory
-    map_img_name = meta_id.replace('.pt', '.png')
-    map_img_path = os.path.join('./maps', map_img_name)
-    if not os.path.exists(map_img_path):
-        # Fallback to older paths just in case
-        map_img_path = os.path.join('./processed/maps', map_img_name)
-    
-    if os.path.exists(map_img_path):
-        return map_img_path
+
+    map_stem = os.path.splitext(meta_id)[0].replace('_map', '')
+    map_dirs = [
+        os.path.join(BASE_DIR, 'maps'),
+        os.path.join(BASE_DIR, 'processed', 'maps')
+    ]
+    map_exts = ['.png', '.jpg', '.jpeg']
+
+    for map_dir in map_dirs:
+        for map_ext in map_exts:
+            map_img_path = os.path.join(map_dir, f"{map_stem}{map_ext}")
+            if os.path.exists(map_img_path):
+                return map_img_path
+
     return None
 
 def get_map_extent(meta_id):
@@ -193,20 +298,71 @@ def get_map_extent(meta_id):
     By default, 'ymin' and 'ymax' might need to be inverted (e.g. ymax, ymin) 
     if your image origin is top-left, but we pass them as [xmin, xmax, ymin, ymax].
     """
-    scene = meta_id.replace('_map.pt', '') if meta_id else "unknown"
-    
-    # Placeholder mapping -- adjust to true dataset metric extents
-    # Format: [xmin, xmax, ymin, ymax]
-    extents = {
-        'seq_eth': [0.0, 14.2, 14.2, 0.0],
-        'seq_hotel': [0.0, 14.2, 14.2, 0.0],
-        'zara01': [0.0, 14.2, 14.2, 0.0],
-        'zara02': [0.0, 14.2, 14.2, 0.0],
-        'uni_examples': [0.0, 14.2, 14.2, 0.0]
-    }
-    return extents.get(scene, [0.0, 20.0, 20.0, 0.0])
+    return [0.0, 14.2, 14.2, 0.0]
 
 def plot_trajectories(trajectories, title_prefix="Trajectory", no_map=False):
+    for idx, traj in enumerate(trajectories):
+        plt.figure(figsize=(10, 8))
+        plt.axis('equal')
+        
+        meta_id = traj.get('meta_id')
+        H = traj.get('H')
+        map_img_path = get_map_image(meta_id)
+        
+        obs = traj['obs']
+        pred = traj['pred']
+        gt = traj['gt']
+        
+        # Helper function to apply Homography projection
+        def project_to_pixels(coords, H_mat):
+            if H_mat is None: return coords
+            ones = np.ones((coords.shape[0], 1))
+            homo_coords = np.hstack([coords, ones])
+            proj = (H_mat @ homo_coords.T).T
+            proj[:, 0] /= proj[:, 2]
+            proj[:, 1] /= proj[:, 2]
+            return proj[:, :2]
+
+        if map_img_path and not no_map and H is not None:
+            img = mpimg.imread(map_img_path)
+            # Plot standard image without extent
+            plt.imshow(img) 
+            
+            # Convert meter paths to pixel paths
+            obs_p = project_to_pixels(obs, H)
+            pred_p = project_to_pixels(pred, H)
+            gt_p = project_to_pixels(gt, H)
+            
+            plt.plot(obs_p[:, 0], obs_p[:, 1], color='blue', marker='o', linestyle='-', linewidth=2, label='Observed')
+            plt.plot(gt_p[:, 0], gt_p[:, 1], color='green', marker='s', linestyle='-', linewidth=2, label='Ground Truth')
+            plt.plot(pred_p[:, 0], pred_p[:, 1], color='red', marker='*', linestyle='--', linewidth=2, label='Prediction')
+            
+            plt.plot([obs_p[-1, 0], gt_p[0, 0]], [obs_p[-1, 1], gt_p[0, 1]], color='green', linestyle='-', linewidth=2)
+            plt.plot([obs_p[-1, 0], pred_p[0, 0]], [obs_p[-1, 1], pred_p[0, 1]], color='red', linestyle='--', linewidth=2)
+            
+            plt.grid(False)
+        else:
+            plt.grid(True, linestyle='--', alpha=0.6)
+            all_x = np.concatenate([obs[:, 0], gt[:, 0], pred[:, 0]])
+            all_y = np.concatenate([obs[:, 1], gt[:, 1], pred[:, 1]])
+            cx, cy = np.mean(all_x), np.mean(all_y)
+            window = 10.0 
+            plt.xlim(cx - window, cx + window)
+            plt.ylim(cy - window, cy + window) 
+            
+            plt.plot(obs[:, 0], obs[:, 1], color='blue', marker='o', linestyle='-', linewidth=2, label='Observed')
+            plt.plot(gt[:, 0], gt[:, 1], color='green', marker='s', linestyle='-', linewidth=2, label='Ground Truth')
+            plt.plot(pred[:, 0], pred[:, 1], color='red', marker='*', linestyle='--', linewidth=2, label='Prediction')
+            
+            plt.plot([obs[-1, 0], gt[0, 0]], [obs[-1, 1], gt[0, 1]], color='green', linestyle='-', linewidth=2)
+            plt.plot([obs[-1, 0], pred[0, 0]], [obs[-1, 1], pred[0, 1]], color='red', linestyle='--', linewidth=2)
+
+        plt.title(f"{title_prefix} {idx+1} | ADE: {traj['ade']:.4f}")
+        plt.legend(loc='best')
+        plt.xlabel("X")
+        plt.ylabel("Y")
+        plt.show()
+def plot_trajectories_1(trajectories, title_prefix="Trajectory", no_map=False):
     for idx, traj in enumerate(trajectories):
         plt.figure(figsize=(10, 8))
         plt.axis('equal')
@@ -262,49 +418,35 @@ def main():
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-    
-    # Validation: Check if model trained on ETH/UCY datasets
-    train_dataset = getattr(args, 'dataset', '')
-    if isinstance(checkpoint, dict) and not train_dataset:
-         train_dataset = checkpoint.get('dataset', '')
-         
-    train_dataset_lower = str(train_dataset).lower()
-    valid_datasets = {
-        'eth': 'seq_eth',
-        'hotel': 'seq_hotel',
-        'univ': 'uni_examples',
-        'zara1': 'zara01',
-        'zara2': 'zara02'
-    }
 
-    if train_dataset_lower not in valid_datasets:
-         print(f"Error: Model was not trained on an ETH/UCY dataset. Dataset found: '{train_dataset}'")
-         sys.exit(1)
-    
-    # Map the trained split to its corresponding test scene dir
-    scene_name = valid_datasets[train_dataset_lower]
+    scene_name = resolve_eval_scene_name(model_path, args, checkpoint)
     
     state_dict = checkpoint
     if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
         state_dict = checkpoint['state_dict']
     
-    test_data_dir = os.path.join('./processed/test', scene_name)
-    
-    if not os.path.exists(test_data_dir):
-         print(f"Test data directory {test_data_dir} not found.")
-         sys.exit(1)
-        
-    print(f"Loading ETH Test Data from {test_data_dir}...")
-    
-    dset_test = TrajectoryDataset(
-        data_dir=test_data_dir,
-        obs_len=args.obs_seq_len,
-        pred_len=args.pred_seq_len,
-        skip=1,
-        norm_lap_matr=True,
-        delim=args.delim,
-        dataset_name=train_dataset_lower
-    )
+    test_scene_dirs = resolve_test_scene_dirs(scene_name)
+
+    if not test_scene_dirs:
+        print(f"Test data directories not found for scene '{scene_name}'.")
+        sys.exit(1)
+
+    print(f"Loading ETH Test Data from: {test_scene_dirs}")
+
+    test_datasets = [
+        TrajectoryDataset(
+            data_dir=test_data_dir,
+            obs_len=args.obs_seq_len,
+            pred_len=args.pred_seq_len,
+            skip=1,
+            norm_lap_matr=True,
+            delim=args.delim,
+            dataset_name=getattr(args, 'dataset', '')
+        )
+        for test_data_dir in test_scene_dirs
+    ]
+
+    dset_test = test_datasets[0] if len(test_datasets) == 1 else torch.utils.data.ConcatDataset(test_datasets)
     
     loader_test = DataLoader(
         dset_test,

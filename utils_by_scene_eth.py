@@ -67,6 +67,13 @@ def read_file(file_path, delim=None):
             data.append(line_data)
     return np.asarray(data)
 
+def get_trajectory_txt_files(scene_path):
+    txt_files = glob.glob(os.path.join(scene_path, '**', '*.txt'), recursive=True)
+    return sorted(
+        file_path for file_path in txt_files
+        if os.path.basename(file_path).lower() != 'h.txt'
+    )
+
 def seq_to_graph(seq_, seq_rel, norm_lap_matr=True):
     if torch.is_tensor(seq_):
         seq_np = seq_.detach().cpu().numpy()
@@ -144,6 +151,7 @@ class TrajectoryDataset(Dataset):
             self._process_raw_data()
             self._init_lazy_loading()
 
+
     def _process_raw_data(self):
         datasets = ['ETH', 'UCY']
         print(f"Processing scenes in ETH and UCY.")
@@ -157,15 +165,10 @@ class TrajectoryDataset(Dataset):
             
             for scene_name in scenes:
                 current_scene_path = os.path.join(dataset_path, scene_name)
-                txt_files = glob.glob(os.path.join(current_scene_path, '*.txt'))
-                
+                txt_files = get_trajectory_txt_files(current_scene_path)
                 if not txt_files:
                     print(f"Warning: No .txt files found in {current_scene_path}.")
                     continue
-                
-                img_path = os.path.join(current_scene_path, 'bg.jpg')
-                if not os.path.exists(img_path):
-                    img_path = os.path.join(current_scene_path, 'bg.png')
                 
                 splits = ['train', 'val', 'test']
                 for s_name in splits:
@@ -174,11 +177,8 @@ class TrajectoryDataset(Dataset):
                     
                     split_out_dir = os.path.join(self.processed_dir, s_name, scene_name)
                     os.makedirs(split_out_dir, exist_ok=True)
-                    
-                    meta_id = f"{scene_name}_map.pt" 
 
                     print(f"Processing: {s_name} | {dataset_name} | {scene_name}")
-                    # Process all txt files in the scene dir
                     for txt_file in txt_files:
                         base_txt = os.path.splitext(os.path.basename(txt_file))[0]
                         save_name = f"{scene_name}_{base_txt}_{s_name}.pkl"
@@ -187,9 +187,28 @@ class TrajectoryDataset(Dataset):
                         if os.path.exists(save_path) and not self.reload_data:
                             continue
 
-                        self._process_single_video(txt_file, meta_id, save_path, img_path, s_name)
+                        sub_folder_name = os.path.basename(os.path.dirname(txt_file))
+                        meta_id = f"{sub_folder_name}_map.pt"
+                        
+                        img_path = os.path.join(os.path.dirname(txt_file), 'bg.jpg')
+                        if not os.path.exists(img_path):
+                            img_path = os.path.join(os.path.dirname(txt_file), 'bg.png')
+                            
+                        # --- NEW: Load Homography Matrix ---
+                        H_path = os.path.join(os.path.dirname(txt_file), 'H.txt')
+                        if os.path.exists(H_path):
+                            H = np.loadtxt(H_path)
+                            if np.shape(H) != (3, 3):
+                                print(f"Warning: Invalid H.txt shape for {sub_folder_name}, using Identity matrix.")
+                                H = np.eye(3)
+                        else:
+                            print(f"Warning: No H.txt found for {sub_folder_name}, using Identity matrix.")
+                            H = np.eye(3)
+                        # -----------------------------------
 
-    def _process_single_video(self, file_path, meta_id, save_path, img_path, split_name):
+                        self._process_single_video(txt_file, meta_id, save_path, img_path, s_name, H)
+
+    def _process_single_video(self, file_path, meta_id, save_path, img_path, split_name, H):
         if os.path.exists(img_path):
             with Image.open(img_path) as img:
                 orig_w, orig_h = img.size
@@ -198,7 +217,6 @@ class TrajectoryDataset(Dataset):
             orig_w, orig_h = 512, 512
 
         raw_data = read_file(file_path, self.delim)
-        # Format: frame_id, agent_id, pos_x, pos_y
         data = raw_data[:, [0, 1, 2, 3]]
         data = data[data[:, 0].argsort()]
         frames = np.unique(data[:, 0]).tolist()
@@ -228,7 +246,6 @@ class TrajectoryDataset(Dataset):
             print(f"Skipping {split_name} for {file_path}: No full trajectories found.")
             return
 
-        # Re-verify frames after filtering
         frames = np.unique(data[:, 0]).tolist()
         
         frame_data = []
@@ -277,17 +294,13 @@ class TrajectoryDataset(Dataset):
 
                 curr_obj_seq = np.transpose(curr_obj_seq[:, 2:4]) 
                 
-                # --- STATIONARY AGENT FILTER ---
-                # Changed threshold for ETH metric scale
                 start_pos = curr_obj_seq[:, 0:1] 
                 dists_from_start = np.linalg.norm(curr_obj_seq - start_pos, axis=0)
                 max_displacement = np.max(dists_from_start)
                 
                 if max_displacement < self.min_displacement: 
                     continue 
-                # -------------------------------
 
-                # --- LINEAR AGENT FILTER ---
                 t_steps = np.arange(self.seq_len)
                 res_x = np.polyfit(t_steps, curr_obj_seq[0, :], 1, full=True)[1]
                 res_y = np.polyfit(t_steps, curr_obj_seq[1, :], 1, full=True)[1]
@@ -296,11 +309,9 @@ class TrajectoryDataset(Dataset):
                 err_y = res_y[0] if len(res_y) > 0 else 0.0
                 total_linear_error = err_x + err_y
                 
-                if total_linear_error < 0.05:  # Scaled down for meters
+                if total_linear_error < 0.05:  
                     continue 
-                # ---------------------------------
                 
-                # --- PHYSICS FILTER ---
                 vel_vectors = curr_obj_seq[:, 1:] - curr_obj_seq[:, :-1]
                 v1 = vel_vectors[:, :-1]
                 v2 = vel_vectors[:, 1:]
@@ -318,9 +329,6 @@ class TrajectoryDataset(Dataset):
                     
                     if np.max(angles_deg) > 80.0: 
                         continue 
-                # -------------------------------------------
-
-                # No Boundary filter since ETH isn't inherently bounded to 512x512 coordinate limits
                
                 dx = curr_obj_seq[0, 1:] - curr_obj_seq[0, :-1]
                 dy = curr_obj_seq[1, 1:] - curr_obj_seq[1, :-1]
@@ -358,7 +366,11 @@ class TrajectoryDataset(Dataset):
                 non_linear_ped_list.append(np.array(_non_linear_ped))
                 num_peds_in_seq.append(num_peds_considered)
                 loss_mask_list.append(curr_loss_mask[:num_peds_considered])
-                seq_meta_list.append((meta_id, orig_w, orig_h))
+                
+                # --- NEW: Save H Matrix in Metadata ---
+                seq_meta_list.append((meta_id, orig_w, orig_h, H))
+                # --------------------------------------
+                
                 rot_angle_list.append(curr_theta[:num_peds_considered]) 
                 
                 s_ = curr_seq[:num_peds_considered]
